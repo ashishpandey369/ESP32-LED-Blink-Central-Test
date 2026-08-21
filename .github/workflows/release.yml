@@ -1,0 +1,40 @@
+name: Build and publish firmware release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        env:
+          FW_VERSION: ${{ github.ref_name }}
+          FW_BUILD_ID: led-blink-central-test::${{ github.ref_name }}
+        run: pio run
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            .pio/build/esp32dev/firmware.bin \
+            --title "$TAG" \
+            --generate-notes
