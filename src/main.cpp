@@ -13,7 +13,9 @@
 #define UEC_BUILD_ID "led-blink-central-test::0.1.0"
 #endif
 
-constexpr uint8_t LED_PIN = LED_BUILTIN;
+// The generic ESP32 Dev Module target does not define LED_BUILTIN.
+// GPIO2 is the onboard LED pin on the common ESP32 DevKit boards.
+constexpr uint8_t LED_PIN = 2;
 constexpr unsigned long BLINK_INTERVAL_MS = 1000;
 
 ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
