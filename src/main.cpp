@@ -10,11 +10,9 @@
 #endif
 
 #ifndef UEC_BUILD_ID
-#define UEC_BUILD_ID "led-blink-test-v0.1.0"
+#define UEC_BUILD_ID "led-blink-central-test::0.1.0"
 #endif
 
-// Application code stays separate from device-management code.
-// This is the pattern future ESP32 projects can reuse.
 constexpr uint8_t LED_PIN = LED_BUILTIN;
 constexpr unsigned long BLINK_INTERVAL_MS = 1000;
 
