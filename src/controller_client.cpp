@@ -44,11 +44,62 @@ void ControllerClient::handleProvisioningRequests() { if (!provisioningMode_) { 
 
 void ControllerClient::begin() { deviceId_ = makeDeviceId(); loadOrCreateDeviceKey(); Serial.printf("[CONTROLLER] URL: %s\n", controllerUrl_.c_str()); Serial.printf("[CONTROLLER] Device ID: %s\n", deviceId_.c_str()); Serial.printf("[CONTROLLER] Firmware: %s | Build: %s\n", firmwareVersion_.c_str(), buildId_.c_str()); if (!connectSavedWiFi()) startProvisioning(); startWebServer(); if (!provisioningMode_) { Serial.println("[CONTROLLER] Wi-Fi ready. Sending first heartbeat now..."); sendHeartbeat(); } }
 
-void ControllerClient::processCommands(const String& json) { const int commandsStart = json.indexOf("\"commands\":["); if (commandsStart < 0) return; int cursor = commandsStart; while (true) { const int idPos = json.indexOf("\"id\":\"", cursor); if (idPos < 0) break; const String id = jsonValue(json, "id", idPos); const int typePos = json.indexOf("\"type\":\"", idPos); if (typePos < 0) break; const String type = jsonValue(json, "type", typePos); if (type == "message") { const int messagePos = json.indexOf("\"message\":\"", typePos); if (messagePos >= 0) { pendingMessage_ = jsonValue(json, "message", messagePos); Serial.printf("[COMMAND] Remote message: %s\n", pendingMessage_.c_str()); } } else if (type == "ota") { const String tag = jsonValue(json, "tag", typePos); const String version = jsonValue(json, "version", typePos); Serial.printf("[COMMAND] OTA requested: %s (%s)\n", tag.c_str(), version.c_str()); if (!tag.isEmpty()) performOta(tag, version); } cursor = typePos + 8; const int nextId = json.indexOf("\"id\":\"", cursor); if (nextId < 0) break; cursor = nextId; break; } }
+void ControllerClient::queueAck(const String& id, const char* status, const String& result) { if (id.isEmpty()) return; if (pendingAcks_.length()) pendingAcks_ += ','; pendingAcks_ += "{\"id\":\"" + id + "\",\"status\":\"" + String(status) + "\",\"result\":\"" + result + "\"}"; }
 
-void ControllerClient::performOta(const String& tag, const String& version) { if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); return; } HTTPClient http; String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_; if (!http.begin(url)) { Serial.println("[OTA] HTTP initialization failed."); return; } http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_); const int status = http.GET(); if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return; } const int contentLength = http.getSize(); if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return; } WiFiClient* stream = http.getStreamPtr(); const size_t written = Update.writeStream(*stream); if (written != static_cast<size_t>(contentLength) || !Update.end(true)) { Serial.printf("[OTA] Update failed. Written=%u expected=%d\n", static_cast<unsigned>(written), contentLength); http.end(); return; } Serial.println("[OTA] Update complete. Restarting..."); http.end(); delay(500); ESP.restart(); }
+void ControllerClient::processCommands(const String& json) {
+  const int commandsStart = json.indexOf("\"commands\":[");
+  if (commandsStart < 0) return;
+  int cursor = commandsStart;
+  while (true) {
+    const int idPos = json.indexOf("\"id\":\"", cursor); if (idPos < 0) break;
+    const String id = jsonValue(json, "id", idPos);
+    const int typePos = json.indexOf("\"type\":\"", idPos); if (typePos < 0) break;
+    const String type = jsonValue(json, "type", typePos);
+    if (type == "message") {
+      const int messagePos = json.indexOf("\"message\":\"", typePos);
+      if (messagePos >= 0) { pendingMessage_ = jsonValue(json, "message", messagePos); Serial.printf("[COMMAND] Remote message: %s\n", pendingMessage_.c_str()); queueAck(id, "executed", "message_received"); }
+    } else if (type == "ota") {
+      const String tag = jsonValue(json, "tag", typePos), version = jsonValue(json, "version", typePos);
+      Serial.printf("[COMMAND] OTA requested: %s (%s)\n", tag.c_str(), version.c_str());
+      if (tag.isEmpty()) queueAck(id, "failed", "missing_tag");
+      else if (performOta(tag, version)) return;
+      else queueAck(id, "failed", "ota_failed");
+    } else queueAck(id, "rejected", "unsupported_command");
+    const int nextId = json.indexOf("\"id\":\"", typePos + 8); if (nextId < 0) break; cursor = nextId;
+  }
+}
 
-void ControllerClient::sendHeartbeat() { if (provisioningMode_ || WiFi.status() != WL_CONNECTED) return; if (lastHeartbeatAt_ != 0 && millis() - lastHeartbeatAt_ < HEARTBEAT_INTERVAL_MS) return; lastHeartbeatAt_ = millis(); HTTPClient http; const String url = controllerUrl_ + "/api/device/heartbeat"; if (!http.begin(url)) { Serial.println("[HEARTBEAT] HTTP begin failed; retrying soon."); lastHeartbeatAt_ = 0; return; } http.setConnectTimeout(10000); http.setTimeout(10000); http.addHeader("Content-Type", "application/json"); http.addHeader("X-Device-Key", deviceKey_); http.addHeader("User-Agent", "ESP32-LED-Blink-Central-Test/" + firmwareVersion_); const String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis()) + "}"; Serial.printf("[HEARTBEAT] POST %s\n", url.c_str()); const int status = http.POST(body); const String response = http.getString(); if (status == HTTP_CODE_OK) { Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); } else { Serial.printf("[HEARTBEAT] FAILED HTTP %d | %s\n", status, response.c_str()); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); } http.end(); }
+bool ControllerClient::performOta(const String& tag, const String& version) {
+  if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); return false; }
+  HTTPClient http;
+  const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_;
+  if (!http.begin(url)) { Serial.println("[OTA] HTTP initialization failed."); return false; }
+  http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_);
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return false; }
+  const int contentLength = http.getSize();
+  if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
+  WiFiClient* stream = http.getStreamPtr(); const size_t written = Update.writeStream(*stream);
+  if (written != static_cast<size_t>(contentLength) || !Update.end(true)) { Serial.printf("[OTA] Update failed. Written=%u expected=%d\n", static_cast<unsigned>(written), contentLength); Update.abort(); http.end(); return false; }
+  Serial.println("[OTA] Update complete. Restarting..."); http.end(); delay(500); ESP.restart(); return true;
+}
+
+void ControllerClient::sendHeartbeat() {
+  if (provisioningMode_ || WiFi.status() != WL_CONNECTED) return;
+  if (lastHeartbeatAt_ != 0 && millis() - lastHeartbeatAt_ < HEARTBEAT_INTERVAL_MS) return;
+  lastHeartbeatAt_ = millis();
+  HTTPClient http; const String url = controllerUrl_ + "/api/device/heartbeat";
+  if (!http.begin(url)) { Serial.println("[HEARTBEAT] HTTP begin failed; retrying soon."); lastHeartbeatAt_ = 0; return; }
+  http.setConnectTimeout(10000); http.setTimeout(10000); http.addHeader("Content-Type", "application/json"); http.addHeader("X-Device-Key", deviceKey_); http.addHeader("User-Agent", "ESP32-LED-Blink-Central-Test/" + firmwareVersion_);
+  String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis());
+  if (pendingAcks_.length()) { body += ",\"commandAcks\":[" + pendingAcks_ + "]"; pendingAcks_.clear(); }
+  body += "}";
+  Serial.printf("[HEARTBEAT] POST %s\n", url.c_str());
+  const int status = http.POST(body); const String response = http.getString();
+  if (status == HTTP_CODE_OK) { Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); }
+  else { Serial.printf("[HEARTBEAT] FAILED HTTP %d | %s\n", status, response.c_str()); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); }
+  http.end();
+}
 
 void ControllerClient::loop() { if (provisioningMode_) dnsServer.processNextRequest(); webServer.handleClient(); if (WiFi.status() == WL_CONNECTED) sendHeartbeat(); else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); WiFi.reconnect(); } }
 
