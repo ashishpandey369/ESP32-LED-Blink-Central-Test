@@ -10,9 +10,12 @@
 #ifndef UEC_BUILD_ID
 #define UEC_BUILD_ID "led-blink-central-test::0.1.0"
 #endif
+#ifndef UEC_BLINK_INTERVAL_MS
+#define UEC_BLINK_INTERVAL_MS 1000
+#endif
 
 constexpr uint8_t LED_PIN = 2;
-constexpr unsigned long BLINK_INTERVAL_MS = 1000;
+constexpr unsigned long BLINK_INTERVAL_MS = UEC_BLINK_INTERVAL_MS;
 
 ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
 bool ledState = false;
