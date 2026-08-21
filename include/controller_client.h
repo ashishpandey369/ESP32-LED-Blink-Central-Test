@@ -20,6 +20,7 @@ class ControllerClient {
   String deviceId_;
   String deviceKey_;
   String pendingMessage_;
+  String pendingAcks_;
   bool provisioningMode_ = false;
   unsigned long lastHeartbeatAt_ = 0;
   unsigned long lastWiFiRetryAt_ = 0;
@@ -31,7 +32,8 @@ class ControllerClient {
   void startWebServer();
   void sendHeartbeat();
   void processCommands(const String& json);
-  void performOta(const String& tag, const String& version);
+  bool performOta(const String& tag, const String& version);
+  void queueAck(const String& id, const char* status, const String& result = "");
   String chipIdHex() const;
   String generateDeviceKey() const;
   String makeDeviceId() const;
