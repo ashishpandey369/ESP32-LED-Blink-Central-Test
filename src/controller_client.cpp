@@ -13,8 +13,11 @@ constexpr uint16_t DNS_PORT = 53;
 constexpr uint16_t HTTP_PORT = 80;
 constexpr char AP_PREFIX[] = "ESP32-UC-";
 constexpr char AP_PASSWORD_PREFIX[] = "UC-";
-constexpr char WIFI_NS[] = "wifi";
-constexpr char DEVICE_NS[] = "device";
+// Each project must have its own NVS namespace. ESP32 firmware uploads do not
+// normally erase NVS, so a generic "wifi" namespace would leak credentials
+// from another project flashed on the same board.
+constexpr char WIFI_NS[] = "ledblink_wifi";
+constexpr char DEVICE_NS[] = "ledblink_device";
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 30000;
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 
@@ -86,7 +89,7 @@ void ControllerClient::loadOrCreateDeviceKey() {
     preferences.putString("device_key", deviceKey_);
     Serial.println("[DEVICE] Generated permanent device key.");
   } else {
-    Serial.println("[DEVICE] Loaded existing permanent device key.");
+    Serial.println("[DEVICE] Loaded existing project device key.");
   }
   preferences.end();
 }
@@ -100,7 +103,7 @@ bool ControllerClient::connectSavedWiFi() {
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), password.c_str());
-  Serial.printf("[WIFI] Connecting to %s", ssid.c_str());
+  Serial.printf("[WIFI] Connecting to saved project network %s", ssid.c_str());
   const unsigned long deadline = millis() + 15000;
   while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
     delay(250);
@@ -231,18 +234,11 @@ void ControllerClient::processCommands(const String& json) {
       Serial.printf("[COMMAND] OTA requested: %s (%s)\n", tag.c_str(), version.c_str());
       if (!tag.isEmpty()) performOta(tag, version);
     }
-    if (!id.isEmpty()) {
-      // The controller accepts commandAcks in the next heartbeat. The first
-      // acknowledgement is sent immediately on the next heartbeat cycle.
-      pendingMessage_ = pendingMessage_;
-    }
     cursor = typePos + 8;
     if (cursor >= static_cast<int>(json.length())) break;
-    if (json.indexOf("}", cursor) < 0) break;
     const int nextId = json.indexOf("\"id\":\"", cursor);
     if (nextId < 0) break;
     cursor = nextId;
-    // This simple client intentionally processes one command per heartbeat.
     break;
   }
 }
@@ -254,32 +250,17 @@ void ControllerClient::performOta(const String& tag, const String& version) {
   }
   HTTPClient http;
   String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_;
-  if (!http.begin(url)) {
-    Serial.println("[OTA] HTTP initialization failed.");
-    return;
-  }
+  if (!http.begin(url)) { Serial.println("[OTA] HTTP initialization failed."); return; }
   http.setConnectTimeout(10000);
   http.setTimeout(30000);
   http.addHeader("X-Device-Key", deviceKey_);
   const int status = http.GET();
-  if (status != HTTP_CODE_OK) {
-    Serial.printf("[OTA] Download failed: HTTP %d\n", status);
-    http.end();
-    return;
-  }
+  if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d\n", status); http.end(); return; }
   const int contentLength = http.getSize();
-  if (contentLength <= 0 || !Update.begin(contentLength)) {
-    Serial.println("[OTA] Invalid firmware size or Update.begin failed.");
-    http.end();
-    return;
-  }
+  if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return; }
   WiFiClient* stream = http.getStreamPtr();
   const size_t written = Update.writeStream(*stream);
-  if (written != static_cast<size_t>(contentLength) || !Update.end(true)) {
-    Serial.printf("[OTA] Update failed. Written=%u expected=%d\n", static_cast<unsigned>(written), contentLength);
-    http.end();
-    return;
-  }
+  if (written != static_cast<size_t>(contentLength) || !Update.end(true)) { Serial.printf("[OTA] Update failed. Written=%u expected=%d\n", static_cast<unsigned>(written), contentLength); http.end(); return; }
   Serial.println("[OTA] Update complete. Restarting...");
   http.end();
   delay(500);
@@ -293,39 +274,24 @@ void ControllerClient::sendHeartbeat() {
 
   HTTPClient http;
   const String url = controllerUrl_ + "/api/device/heartbeat";
-  if (!http.begin(url)) {
-    lastHeartbeatAt_ = 0;
-    return;
-  }
+  if (!http.begin(url)) { lastHeartbeatAt_ = 0; return; }
   http.setConnectTimeout(10000);
   http.setTimeout(10000);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-Device-Key", deviceKey_);
   http.addHeader("User-Agent", "ESP32-LED-Blink-Central-Test/" + firmwareVersion_);
-
   String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis()) + "}";
   const int status = http.POST(body);
-  if (status == HTTP_CODE_OK) {
-    const String response = http.getString();
-    Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str());
-    processCommands(response);
-  } else {
-    Serial.printf("[HEARTBEAT] HTTP %d\n", status);
-    if (status >= 400) Serial.printf("[HEARTBEAT] %s\n", http.getString().c_str());
-    if (status < 0) lastHeartbeatAt_ = 0;
-  }
+  if (status == HTTP_CODE_OK) { const String response = http.getString(); Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); }
+  else { Serial.printf("[HEARTBEAT] HTTP %d\n", status); if (status >= 400) Serial.printf("[HEARTBEAT] %s\n", http.getString().c_str()); if (status < 0) lastHeartbeatAt_ = 0; }
   http.end();
 }
 
 void ControllerClient::loop() {
   if (provisioningMode_) dnsServer.processNextRequest();
   webServer.handleClient();
-  if (WiFi.status() == WL_CONNECTED) {
-    sendHeartbeat();
-  } else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) {
-    lastWiFiRetryAt_ = millis();
-    WiFi.reconnect();
-  }
+  if (WiFi.status() == WL_CONNECTED) sendHeartbeat();
+  else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); WiFi.reconnect(); }
 }
 
 bool ControllerClient::provisioningMode() const { return provisioningMode_; }
