@@ -55,17 +55,31 @@ void ControllerClient::processCommands(const String& json) {
     const String id = jsonValue(json, "id", idPos);
     const int typePos = json.indexOf("\"type\":\"", idPos); if (typePos < 0) break;
     const String type = jsonValue(json, "type", typePos);
+    const int nextCommand = json.indexOf("{\"id\":\"", typePos + 8);
+    const int commandEnd = nextCommand >= 0 ? nextCommand : json.length();
+    const String commandJson = json.substring(idPos, commandEnd);
+
+    Serial.printf("[COMMAND] Received id=%s type=%s\n", id.c_str(), type.c_str());
+
     if (type == "message") {
-      const int messagePos = json.indexOf("\"message\":\"", typePos);
-      if (messagePos >= 0) { pendingMessage_ = jsonValue(json, "message", messagePos); Serial.printf("[COMMAND] Remote message: %s\n", pendingMessage_.c_str()); queueAck(id, "executed", "message_received"); }
+      const int payloadPos = commandJson.indexOf("\"payload\":{");
+      const String message = payloadPos >= 0 ? jsonValue(commandJson, "message", payloadPos) : jsonValue(commandJson, "message", typePos - idPos);
+      if (!message.isEmpty()) { pendingMessage_ = message; Serial.printf("[COMMAND] Remote message: %s\n", pendingMessage_.c_str()); queueAck(id, "executed", "message_received"); }
+      else queueAck(id, "failed", "missing_message");
     } else if (type == "ota") {
-      const String tag = jsonValue(json, "tag", typePos), version = jsonValue(json, "version", typePos);
-      Serial.printf("[COMMAND] OTA requested: %s (%s)\n", tag.c_str(), version.c_str());
-      if (tag.isEmpty()) queueAck(id, "failed", "missing_tag");
+      const int payloadPos = commandJson.indexOf("\"payload\":{");
+      const String tag = payloadPos >= 0 ? jsonValue(commandJson, "tag", payloadPos) : jsonValue(commandJson, "tag");
+      const String version = payloadPos >= 0 ? jsonValue(commandJson, "version", payloadPos) : jsonValue(commandJson, "version");
+      Serial.printf("[COMMAND] OTA requested: tag=%s version=%s\n", tag.c_str(), version.c_str());
+      if (tag.isEmpty()) { Serial.println("[OTA] Command missing payload.tag"); queueAck(id, "failed", "missing_tag"); }
       else if (performOta(tag, version)) return;
       else queueAck(id, "failed", "ota_failed");
-    } else queueAck(id, "rejected", "unsupported_command");
-    const int nextId = json.indexOf("\"id\":\"", typePos + 8); if (nextId < 0) break; cursor = nextId;
+    } else {
+      queueAck(id, "rejected", "unsupported_command");
+    }
+
+    if (nextCommand < 0) break;
+    cursor = nextCommand;
   }
 }
 
@@ -73,14 +87,17 @@ bool ControllerClient::performOta(const String& tag, const String& version) {
   if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); return false; }
   HTTPClient http;
   const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_;
+  Serial.printf("[OTA] Downloading: %s\n", url.c_str());
   if (!http.begin(url)) { Serial.println("[OTA] HTTP initialization failed."); return false; }
   http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_);
   const int status = http.GET();
   if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return false; }
   const int contentLength = http.getSize();
+  Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength);
   if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
   WiFiClient* stream = http.getStreamPtr(); const size_t written = Update.writeStream(*stream);
-  if (written != static_cast<size_t>(contentLength) || !Update.end(true)) { Serial.printf("[OTA] Update failed. Written=%u expected=%d\n", static_cast<unsigned>(written), contentLength); Update.abort(); http.end(); return false; }
+  Serial.printf("[OTA] Written %u / %d bytes\n", static_cast<unsigned>(written), contentLength);
+  if (written != static_cast<size_t>(contentLength) || !Update.end(true)) { Serial.printf("[OTA] Update failed. Error=%u\n", Update.getError()); Update.abort(); http.end(); return false; }
   Serial.println("[OTA] Update complete. Restarting..."); http.end(); delay(500); ESP.restart(); return true;
 }
 
