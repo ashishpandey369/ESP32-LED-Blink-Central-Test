@@ -94,7 +94,45 @@ bool ControllerClient::performOta(const String& commandId, const String& tag, co
   http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_); const int status = http.GET(); if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return false; }
   const int contentLength = http.getSize(); Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength); if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
   WiFiClient* stream = http.getStreamPtr(); const size_t total = static_cast<size_t>(contentLength); size_t downloaded = 0; int lastBucket = -1; uint8_t buffer[2048]; reportProgress("downloading", 0, 0, total, "Firmware download started");
-  while (downloaded < total) { const size_t remaining = total - downloaded; const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer); const size_t count = stream->readBytes(buffer, want); if (count == 0 || Update.write(buffer, count) != count) { Update.abort(); http.end(); reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware image write failed"); return false; } downloaded += count; const int percent = static_cast<int>((downloaded * 100ULL) / total); const int bucket = percent / 10; if (bucket != lastBucket || downloaded == total) { reportProgress("downloading", percent, downloaded, total, "Downloading firmware"); lastBucket = bucket; } yield(); }
+  while (downloaded < total) {
+    const size_t remaining = total - downloaded;
+    const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    const size_t count = stream->readBytes(buffer, want);
+
+    if (count == 0) {
+      Serial.printf("[OTA] DIAGNOSTIC: stream->readBytes returned 0 | downloaded=%u/%u | requested=%u\n",
+                    static_cast<unsigned>(downloaded),
+                    static_cast<unsigned>(total),
+                    static_cast<unsigned>(want));
+      Update.abort();
+      http.end();
+      reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware download stream returned 0 bytes");
+      return false;
+    }
+
+    const size_t written = Update.write(buffer, count);
+    if (written != count) {
+      Serial.printf("[OTA] DIAGNOSTIC: Update.write mismatch | downloaded=%u/%u | read=%u | written=%u | update_error=%d\n",
+                    static_cast<unsigned>(downloaded),
+                    static_cast<unsigned>(total),
+                    static_cast<unsigned>(count),
+                    static_cast<unsigned>(written),
+                    static_cast<int>(Update.getError()));
+      Update.abort();
+      http.end();
+      reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware image write failed");
+      return false;
+    }
+
+    downloaded += count;
+    const int percent = static_cast<int>((downloaded * 100ULL) / total);
+    const int bucket = percent / 10;
+    if (bucket != lastBucket || downloaded == total) {
+      reportProgress("downloading", percent, downloaded, total, "Downloading firmware");
+      lastBucket = bucket;
+    }
+    yield();
+  }
   const bool valid = Update.end(true); http.end(); if (!valid) { Update.abort(); reportProgress("failed", 100, downloaded, total, "Firmware verification failed"); return false; }
   reportProgress("installing", 100, downloaded, total, "Firmware written successfully; installing"); delay(250); reportProgress("rebooting", 100, downloaded, total, "Restarting into the new firmware"); Serial.println("[OTA] Update complete. Restarting..."); delay(250); ESP.restart(); return true;
 }
