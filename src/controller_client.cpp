@@ -9,6 +9,8 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 namespace {
 constexpr uint16_t DNS_PORT = 53;
@@ -17,13 +19,18 @@ constexpr char AP_PREFIX[] = "ESP32-UC-";
 constexpr char AP_PASSWORD_PREFIX[] = "UC-";
 constexpr char WIFI_NS[] = "ledblink_wifi";
 constexpr char DEVICE_NS[] = "ledblink_device";
-constexpr unsigned long HEARTBEAT_INTERVAL_MS = 30000;
+constexpr unsigned long HEARTBEAT_INTERVAL_MS = 10000;
 constexpr unsigned long FIRST_HEARTBEAT_RETRY_MS = 5000;
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
+constexpr unsigned long OTA_NO_PROGRESS_TIMEOUT_MS = 60000;
+constexpr unsigned long OTA_STREAM_READ_TIMEOUT_MS = 10000;
 DNSServer dnsServer;
 WebServer webServer(HTTP_PORT);
 Preferences preferences;
+volatile bool otaRunning = false;
+String otaCommandId;
+
 bool syncClock() {
   Serial.println("[TIME] Synchronizing clock...");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
@@ -41,6 +48,7 @@ bool syncClock() {
   Serial.println("[TIME] NTP synchronization timed out.");
   return false;
 }
+
 bool resolveControllerHost() {
   IPAddress resolved;
   constexpr char HOST[] = "esp32-universal-controller.onrender.com";
@@ -52,8 +60,183 @@ bool resolveControllerHost() {
   Serial.println("[NET] DNS FAILED.");
   return false;
 }
-String htmlEscape(const String& value) { String out; out.reserve(value.length() + 16); for (size_t i = 0; i < value.length(); ++i) { switch (value[i]) { case '&': out += "&amp;"; break; case '<': out += "&lt;"; break; case '>': out += "&gt;"; break; case '"': out += "&quot;"; break; case '\'': out += "&#39;"; break; default: out += value[i]; break; } } return out; }
-String jsonValue(const String& json, const String& key, size_t from = 0) { const String marker = String("\"") + key + "\":\""; const int start = json.indexOf(marker, from); if (start < 0) return ""; const int valueStart = start + marker.length(); int end = valueStart; while (end < static_cast<int>(json.length())) { if (json[end] == '"' && (end == valueStart || json[end - 1] != '\\')) break; ++end; } String value = json.substring(valueStart, end); value.replace("\\\"", "\""); value.replace("\\n", "\n"); value.replace("\\r", "\r"); value.replace("\\\\", "\\"); return value; }
+
+String htmlEscape(const String& value) {
+  String out;
+  out.reserve(value.length() + 16);
+  for (size_t i = 0; i < value.length(); ++i) {
+    switch (value[i]) {
+      case '&': out += "&amp;"; break;
+      case '<': out += "&lt;"; break;
+      case '>': out += "&gt;"; break;
+      case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      default: out += value[i]; break;
+    }
+  }
+  return out;
+}
+
+String jsonValue(const String& json, const String& key, size_t from = 0) {
+  const String marker = String("\"") + key + "\":\"";
+  const int start = json.indexOf(marker, from);
+  if (start < 0) return "";
+  const int valueStart = start + marker.length();
+  int end = valueStart;
+  while (end < static_cast<int>(json.length())) {
+    if (json[end] == '"' && (end == valueStart || json[end - 1] != '\\')) break;
+    ++end;
+  }
+  String value = json.substring(valueStart, end);
+  value.replace("\\\"", "\"");
+  value.replace("\\n", "\n");
+  value.replace("\\r", "\r");
+  value.replace("\\\\", "\\");
+  return value;
+}
+
+struct OtaTaskContext {
+  String controllerUrl;
+  String deviceId;
+  String deviceKey;
+  String commandId;
+  String tag;
+  String version;
+};
+
+void reportOtaProgress(const OtaTaskContext& ctx, const char* state, int percent, size_t downloaded, size_t total, const String& detail) {
+  if (WiFi.status() != WL_CONNECTED || ctx.controllerUrl.isEmpty() || ctx.commandId.isEmpty()) return;
+  WiFiClientSecure progressClient;
+  progressClient.setInsecure();
+  HTTPClient progressHttp;
+  const String progressUrl = ctx.controllerUrl + "/api/device/ota-progress";
+  if (!progressHttp.begin(progressClient, progressUrl)) return;
+  progressHttp.setConnectTimeout(5000);
+  progressHttp.setTimeout(5000);
+  progressHttp.addHeader("Content-Type", "application/json");
+  progressHttp.addHeader("X-Device-Key", ctx.deviceKey);
+  String body = "{\"deviceId\":\"" + ctx.deviceId + "\",\"commandId\":\"" + ctx.commandId + "\",\"status\":\"" + String(state) + "\",\"percent\":" + String(percent) + ",\"downloaded\":" + String(downloaded) + ",\"total\":" + String(total) + ",\"tag\":\"" + ctx.tag + "\",\"message\":\"" + detail + "\"}";
+  const int status = progressHttp.POST(body);
+  Serial.printf("[OTA] Progress report: %s %d%% HTTP %d\n", state, percent, status);
+  progressHttp.end();
+}
+
+void otaTask(void* parameter) {
+  OtaTaskContext* ctx = static_cast<OtaTaskContext*>(parameter);
+  Serial.printf("[OTA] Background task started: command=%s version=%s\n", ctx->commandId.c_str(), ctx->version.c_str());
+
+  const String url = ctx->controllerUrl + "/api/device/firmware/download/" + ctx->tag + "?deviceId=" + ctx->deviceId;
+  Serial.printf("[OTA] Downloading: %s\n", url.c_str());
+  reportOtaProgress(*ctx, "downloading", 0, 0, 0, "Firmware download started");
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(10000);
+  http.setTimeout(OTA_STREAM_READ_TIMEOUT_MS);
+  if (!http.begin(secureClient, url)) {
+    reportOtaProgress(*ctx, "failed", 0, 0, 0, "HTTP initialization failed");
+    otaRunning = false;
+    delete ctx;
+    vTaskDelete(nullptr);
+    return;
+  }
+  http.addHeader("X-Device-Key", ctx->deviceKey);
+  const int status = http.GET();
+  if (status != HTTP_CODE_OK) {
+    Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str());
+    reportOtaProgress(*ctx, "failed", 0, 0, 0, String("Firmware download HTTP ") + String(status));
+    http.end();
+    otaRunning = false;
+    delete ctx;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  const int contentLength = http.getSize();
+  Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength);
+  if (contentLength <= 0 || !Update.begin(static_cast<size_t>(contentLength))) {
+    Serial.println("[OTA] Invalid firmware size or Update.begin failed.");
+    reportOtaProgress(*ctx, "failed", 0, 0, contentLength > 0 ? static_cast<size_t>(contentLength) : 0, "Invalid firmware size or insufficient OTA space");
+    http.end();
+    otaRunning = false;
+    delete ctx;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  WiFiClient* stream = http.getStreamPtr();
+  const size_t total = static_cast<size_t>(contentLength);
+  size_t downloaded = 0;
+  int lastBucket = -1;
+  unsigned long lastProgressAt = millis();
+  unsigned long lastReportAt = 0;
+  unsigned long lastWaitLogAt = 0;
+  uint8_t buffer[2048];
+  bool writeOk = true;
+
+  while (downloaded < total) {
+    const size_t remaining = total - downloaded;
+    const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    const size_t count = stream->readBytes(buffer, want);
+    if (count == 0) {
+      const unsigned long now = millis();
+      const unsigned long idle = now - lastProgressAt;
+      if (idle >= OTA_NO_PROGRESS_TIMEOUT_MS) {
+        Serial.println("[OTA] No download progress for 60 seconds. Aborting.");
+        writeOk = false;
+        break;
+      }
+      if (lastWaitLogAt == 0 || now - lastWaitLogAt >= 10000) {
+        Serial.printf("[OTA] Waiting for stream... %lu seconds remaining.\n", (OTA_NO_PROGRESS_TIMEOUT_MS - idle) / 1000UL);
+        lastWaitLogAt = now;
+      }
+      yield();
+      continue;
+    }
+
+    const size_t written = Update.write(buffer, count);
+    if (written != count) {
+      Serial.printf("[OTA] Update.write mismatch | read=%u | written=%u | update_error=%d\n", static_cast<unsigned>(count), static_cast<unsigned>(written), static_cast<int>(Update.getError()));
+      writeOk = false;
+      break;
+    }
+
+    downloaded += count;
+    lastProgressAt = millis();
+    lastWaitLogAt = 0;
+    const int percent = static_cast<int>((downloaded * 100ULL) / total);
+    const int bucket = percent / 10;
+    const unsigned long now = millis();
+    if (bucket != lastBucket || now - lastReportAt >= 750 || downloaded == total) {
+      reportOtaProgress(*ctx, "downloading", percent, downloaded, total, "Downloading firmware");
+      Serial.printf("[OTA] Download progress: %d%% | %u/%u bytes\n", percent, static_cast<unsigned>(downloaded), static_cast<unsigned>(total));
+      lastBucket = bucket;
+      lastReportAt = now;
+    }
+    yield();
+  }
+
+  const bool valid = writeOk && downloaded == total && Update.end(true);
+  http.end();
+  if (!valid) {
+    Update.abort();
+    const int percent = total ? static_cast<int>((downloaded * 100ULL) / total) : 0;
+    const String detail = downloaded < total ? "Firmware download stalled for 60 seconds" : "Firmware image write failed";
+    reportOtaProgress(*ctx, "failed", percent, downloaded, total, detail);
+    otaRunning = false;
+    delete ctx;
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  reportOtaProgress(*ctx, "installing", 100, total, total, "Firmware written successfully; installing");
+  delay(250);
+  reportOtaProgress(*ctx, "rebooting", 100, total, total, "Restarting into the new firmware");
+  Serial.println("[OTA] Update complete. Restarting...");
+  delay(250);
+  ESP.restart();
+}
 }
 
 ControllerClient::ControllerClient(const char* controllerUrl, const char* firmwareVersion, const char* buildId) : controllerUrl_(controllerUrl), firmwareVersion_(firmwareVersion), buildId_(buildId) {}
@@ -74,64 +257,34 @@ void ControllerClient::processCommands(const String& json) {
     const int idPos = json.indexOf("\"id\":\"", cursor); if (idPos < 0) break; const String id = jsonValue(json, "id", idPos); const int typePos = json.indexOf("\"type\":\"", idPos); if (typePos < 0) break; const String type = jsonValue(json, "type", typePos); const int nextCommand = json.indexOf("{\"id\":\"", typePos + 8); const int commandEnd = nextCommand >= 0 ? nextCommand : json.length(); const String commandJson = json.substring(idPos, commandEnd);
     Serial.printf("[COMMAND] Received id=%s type=%s\n", id.c_str(), type.c_str());
     if (type == "message") { const int payloadPos = commandJson.indexOf("\"payload\":{"); const String msg = payloadPos >= 0 ? jsonValue(commandJson, "message", payloadPos) : jsonValue(commandJson, "message", typePos - idPos); if (!msg.isEmpty()) { pendingMessage_ = msg; Serial.printf("[COMMAND] Remote message: %s\n", pendingMessage_.c_str()); queueAck(id, "executed", "message_received"); } else queueAck(id, "failed", "missing_message"); }
-    else if (type == "ota") { const int payloadPos = commandJson.indexOf("\"payload\":{"); const String tag = payloadPos >= 0 ? jsonValue(commandJson, "tag", payloadPos) : jsonValue(commandJson, "tag"); const String version = payloadPos >= 0 ? jsonValue(commandJson, "version", payloadPos) : jsonValue(commandJson, "version"); Serial.printf("[COMMAND] OTA requested: tag=%s version=%s\n", tag.c_str(), version.c_str()); if (tag.isEmpty()) { Serial.println("[OTA] Command missing payload.tag"); queueAck(id, "failed", "missing_tag"); } else if (performOta(id, tag, version)) return; else queueAck(id, "failed", "ota_failed"); }
+    else if (type == "ota") {
+      const int payloadPos = commandJson.indexOf("\"payload\":{");
+      const String tag = payloadPos >= 0 ? jsonValue(commandJson, "tag", payloadPos) : jsonValue(commandJson, "tag");
+      const String version = payloadPos >= 0 ? jsonValue(commandJson, "version", payloadPos) : jsonValue(commandJson, "version");
+      Serial.printf("[COMMAND] OTA requested: tag=%s version=%s\n", tag.c_str(), version.c_str());
+      if (tag.isEmpty()) { Serial.println("[OTA] Command missing payload.tag"); queueAck(id, "failed", "missing_tag"); }
+      else if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); queueAck(id, "failed", "already_running_requested_version"); }
+      else if (otaRunning) { Serial.printf("[OTA] OTA already running (command=%s); ignoring duplicate command=%s\n", otaCommandId.c_str(), id.c_str()); }
+      else {
+        OtaTaskContext* context = new OtaTaskContext{controllerUrl_, deviceId_, deviceKey_, id, tag, version};
+        if (!context) { queueAck(id, "failed", "unable_to_allocate_ota_context"); }
+        else {
+          otaCommandId = id;
+          otaRunning = true;
+          const BaseType_t created = xTaskCreatePinnedToCore(otaTask, "ota_update", 12288, context, 1, nullptr, 0);
+          if (created != pdPASS) { otaRunning = false; otaCommandId.clear(); delete context; queueAck(id, "failed", "unable_to_start_ota_task"); Serial.println("[OTA] Failed to create background OTA task."); }
+          else Serial.printf("[OTA] Background OTA task created for command=%s\n", id.c_str());
+        }
+      }
+    }
     else queueAck(id, "rejected", "unsupported_command");
     if (nextCommand < 0) break; cursor = nextCommand;
   }
 }
 
-bool ControllerClient::performOta(const String& commandId, const String& tag, const String& version) {
-  if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); return false; }
-  auto reportProgress = [&](const char* state, int percent, size_t downloaded, size_t total, const String& detail) {
-    WiFiClientSecure progressClient; progressClient.setInsecure();
-    HTTPClient progressHttp; const String progressUrl = controllerUrl_ + "/api/device/ota-progress"; if (!progressHttp.begin(progressClient, progressUrl)) return; progressHttp.setConnectTimeout(5000); progressHttp.setTimeout(5000); progressHttp.addHeader("Content-Type", "application/json"); progressHttp.addHeader("X-Device-Key", deviceKey_);
-    String body = "{\"deviceId\":\"" + deviceId_ + "\",\"commandId\":\"" + commandId + "\",\"status\":\"" + String(state) + "\",\"percent\":" + String(percent) + ",\"downloaded\":" + String(downloaded) + ",\"total\":" + String(total) + ",\"tag\":\"" + tag + "\",\"message\":\"" + detail + "\"}";
-    const int progressStatus = progressHttp.POST(body); Serial.printf("[OTA] Progress report: %s %d%% HTTP %d\n", state, percent, progressStatus); progressHttp.end();
-  };
-
-  WiFiClientSecure secureClient; secureClient.setInsecure();
-  HTTPClient http; const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_; Serial.printf("[OTA] Downloading: %s\n", url.c_str()); if (!http.begin(secureClient, url)) { Serial.println("[OTA] HTTP initialization failed."); return false; }
-  http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_); const int status = http.GET(); if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return false; }
-  const int contentLength = http.getSize(); Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength); if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
-  WiFiClient* stream = http.getStreamPtr(); const size_t total = static_cast<size_t>(contentLength); size_t downloaded = 0; int lastBucket = -1; int emptyReads = 0; uint8_t buffer[2048]; reportProgress("downloading", 0, 0, total, "Firmware download started");
-  while (downloaded < total) {
-    const size_t remaining = total - downloaded;
-    const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-    const size_t count = stream->readBytes(buffer, want);
-    if (count == 0) {
-      ++emptyReads;
-      Serial.printf("[OTA] Download stream temporarily empty (%d/5) | downloaded=%u/%u\n", emptyReads, static_cast<unsigned>(downloaded), static_cast<unsigned>(total));
-      if (emptyReads >= 5) {
-        Serial.println("[OTA] Download stream timeout after 5 retries.");
-        Update.abort();
-        http.end();
-        reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware download stream timed out");
-        return false;
-      }
-      delay(100);
-      yield();
-      continue;
-    }
-    emptyReads = 0;
-    const size_t written = Update.write(buffer, count);
-    if (written != count) {
-      Serial.printf("[OTA] DIAGNOSTIC: Update.write mismatch | downloaded=%u/%u | read=%u | written=%u | update_error=%d\n", static_cast<unsigned>(downloaded), static_cast<unsigned>(total), static_cast<unsigned>(count), static_cast<unsigned>(written), static_cast<int>(Update.getError()));
-      Update.abort();
-      http.end();
-      reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware image write failed");
-      return false;
-    }
-    downloaded += count;
-    const int percent = static_cast<int>((downloaded * 100ULL) / total);
-    const int bucket = percent / 10;
-    if (bucket != lastBucket || downloaded == total) {
-      reportProgress("downloading", percent, downloaded, total, "Downloading firmware");
-      lastBucket = bucket;
-    }
-    yield();
-  }
-  const bool valid = Update.end(true); http.end(); if (!valid) { Update.abort(); reportProgress("failed", 100, downloaded, total, "Firmware verification failed"); return false; }
-  reportProgress("installing", 100, downloaded, total, "Firmware written successfully; installing"); delay(250); reportProgress("rebooting", 100, downloaded, total, "Restarting into the new firmware"); Serial.println("[OTA] Update complete. Restarting..."); delay(250); ESP.restart(); return true;
+bool ControllerClient::performOta(const String&, const String&, const String&) {
+  Serial.println("[OTA] Legacy synchronous OTA path is disabled; use background OTA task.");
+  return false;
 }
 
 void ControllerClient::sendHeartbeat() {
