@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "controller_client.h"
 
 #ifndef UEC_CONTROLLER_URL
@@ -21,6 +23,13 @@ ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_
 bool ledState = false;
 unsigned long lastBlinkAt = 0;
 
+void controllerTask(void*) {
+  for (;;) {
+    controller.loop();
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -34,11 +43,22 @@ void setup() {
   Serial.printf("[FW] Version: %s | Build: %s | Hardware: esp32\n", UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
   Serial.printf("[APP] LED GPIO: %u | Blink interval: %lu ms\n", LED_PIN, BLINK_INTERVAL_MS);
   controller.begin();
+
+  xTaskCreatePinnedToCore(
+    controllerTask,
+    "controller_task",
+    8192,
+    nullptr,
+    1,
+    nullptr,
+    0
+  );
+
+  Serial.println("[CONTROLLER] Background controller task started on core 0.");
+  Serial.println("[APP] Main application loop remains free for device work.");
 }
 
 void loop() {
-  controller.loop();
-
   const unsigned long now = millis();
   if (now - lastBlinkAt >= BLINK_INTERVAL_MS) {
     lastBlinkAt = now;
@@ -54,4 +74,6 @@ void loop() {
     Serial.println(remoteMessage);
     Serial.println("----------------------------------------");
   }
+
+  delay(1);
 }
