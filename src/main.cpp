@@ -8,17 +8,16 @@
 #define UEC_CONTROLLER_URL "https://esp32-universal-controller.onrender.com"
 #endif
 #ifndef UEC_FIRMWARE_VERSION
-#define UEC_FIRMWARE_VERSION "0.5.2"
+#define UEC_FIRMWARE_VERSION "0.5.4"
 #endif
 #ifndef UEC_BUILD_ID
-#define UEC_BUILD_ID "led-blink-central-test::0.5.2"
+#define UEC_BUILD_ID "led-blink-central-test::0.5.4"
 #endif
 #ifndef UEC_BLINK_INTERVAL_MS
-#define UEC_BLINK_INTERVAL_MS 1000
+#define UEC_BLINK_INTERVAL_MS 250
 #endif
 
 constexpr uint8_t LED_D2_PIN = 2;
-constexpr uint8_t LED_D4_PIN = 4;
 constexpr unsigned long BLINK_INTERVAL_MS = UEC_BLINK_INTERVAL_MS;
 constexpr char APP_STATE_NAMESPACE[] = "uc_app_state";
 
@@ -45,7 +44,6 @@ void setDeviceEnabled(bool enabled) {
   if (!deviceEnabled) {
     d2Active = true;
     digitalWrite(LED_D2_PIN, LOW);
-    digitalWrite(LED_D4_PIN, LOW);
   }
 
   Serial.printf("[DEVICE] Remote application control -> %s\n", deviceEnabled ? "ENABLED" : "DISABLED");
@@ -62,9 +60,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   pinMode(LED_D2_PIN, OUTPUT);
-  pinMode(LED_D4_PIN, OUTPUT);
   digitalWrite(LED_D2_PIN, LOW);
-  digitalWrite(LED_D4_PIN, LOW);
   loadDeviceEnabledState();
 
   Serial.println();
@@ -72,7 +68,7 @@ void setup() {
   Serial.println(" ESP32 LED Blink - Central Test Project");
   Serial.println("========================================");
   Serial.printf("[FW] Version: %s | Build: %s | Hardware: esp32\n", UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
-  Serial.printf("[APP] LED pins: D2=%u, D4=%u | Alternating interval: %lu ms\n", LED_D2_PIN, LED_D4_PIN, BLINK_INTERVAL_MS);
+  Serial.printf("[APP] LED pin: D2=%u | Blink interval: %lu ms\n", LED_D2_PIN, BLINK_INTERVAL_MS);
   controller.begin();
 
   xTaskCreatePinnedToCore(
@@ -114,8 +110,7 @@ void loop() {
     lastBlinkAt = now;
     d2Active = !d2Active;
     digitalWrite(LED_D2_PIN, d2Active ? HIGH : LOW);
-    digitalWrite(LED_D4_PIN, d2Active ? LOW : HIGH);
-    Serial.printf("[LED] D2 -> %s | D4 -> %s\n", d2Active ? "ON" : "OFF", d2Active ? "OFF" : "ON");
+    Serial.printf("[LED] D2 -> %s\n", d2Active ? "ON" : "OFF");
   }
 
   delay(1);
