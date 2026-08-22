@@ -2,9 +2,9 @@ Import('env')
 import os
 import re
 
-version = os.getenv('FW_VERSION', '0.1.0').lstrip('v')
+version = os.getenv('FW_VERSION', '0.5.3').lstrip('v')
 if not re.fullmatch(r'\d+\.\d+\.\d+', version):
-    version = '0.1.0'
+    version = '0.5.3'
 
 build_id = os.getenv('FW_BUILD_ID', f'led-blink-central-test::{version}')
 major, minor, patch = [int(part) for part in version.split('.')]
