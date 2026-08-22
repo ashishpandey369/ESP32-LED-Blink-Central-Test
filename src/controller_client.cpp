@@ -24,7 +24,7 @@ constexpr unsigned long FIRST_HEARTBEAT_RETRY_MS = 5000;
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
 constexpr unsigned long OTA_NO_PROGRESS_TIMEOUT_MS = 60000;
-constexpr unsigned long OTA_STREAM_READ_TIMEOUT_MS = 1000;
+constexpr unsigned long OTA_STREAM_READ_TIMEOUT_MS = 5000;
 DNSServer dnsServer;
 WebServer webServer(HTTP_PORT);
 Preferences preferences;
