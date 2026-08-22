@@ -170,7 +170,6 @@ void otaTask(void* parameter) {
   size_t downloaded = 0;
   int lastBucket = -1;
   unsigned long lastProgressAt = millis();
-  unsigned long lastReportAt = 0;
   unsigned long lastWaitLogAt = 0;
   uint8_t buffer[2048];
   bool writeOk = true;
@@ -206,13 +205,11 @@ void otaTask(void* parameter) {
     lastProgressAt = millis();
     lastWaitLogAt = 0;
     const int percent = static_cast<int>((downloaded * 100ULL) / total);
-    const int bucket = percent / 10;
-    const unsigned long now = millis();
-    if (bucket != lastBucket || now - lastReportAt >= 750 || downloaded == total) {
+    const int bucket = percent / 5;
+    if (bucket != lastBucket || downloaded == total) {
       reportOtaProgress(*ctx, "downloading", percent, downloaded, total, "Downloading firmware");
       Serial.printf("[OTA] Download progress: %d%% | %u/%u bytes\n", percent, static_cast<unsigned>(downloaded), static_cast<unsigned>(total));
       lastBucket = bucket;
-      lastReportAt = now;
     }
     yield();
   }
