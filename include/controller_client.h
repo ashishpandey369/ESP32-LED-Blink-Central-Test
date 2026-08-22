@@ -32,7 +32,7 @@ class ControllerClient {
   void startWebServer();
   void sendHeartbeat();
   void processCommands(const String& json);
-  bool performOta(const String& tag, const String& version);
+  bool performOta(const String& commandId, const String& tag, const String& version);
   void queueAck(const String& id, const char* status, const String& result = "");
   String chipIdHex() const;
   String generateDeviceKey() const;
