@@ -1,0 +1,41 @@
+name: Build and publish firmware release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+a permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          VERSION="${RELEASE_VERSION#v}"
+          echo "Building version ${VERSION}"
+          FW_VERSION="${VERSION}" FW_BUILD_ID="led-blink-central-test::${VERSION}" pio run -e esp32dev
+          cp .pio/build/esp32dev/firmware.bin "firmware-${RELEASE_VERSION}.bin"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: firmware-*.bin
