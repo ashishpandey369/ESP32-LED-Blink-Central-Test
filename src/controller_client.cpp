@@ -6,6 +6,8 @@
 #include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
 #include <esp_system.h>
 
 namespace {
@@ -18,9 +20,38 @@ constexpr char DEVICE_NS[] = "ledblink_device";
 constexpr unsigned long HEARTBEAT_INTERVAL_MS = 30000;
 constexpr unsigned long FIRST_HEARTBEAT_RETRY_MS = 5000;
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
+constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
 DNSServer dnsServer;
 WebServer webServer(HTTP_PORT);
 Preferences preferences;
+bool syncClock() {
+  Serial.println("[TIME] Synchronizing clock...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  const unsigned long deadline = millis() + NTP_SYNC_TIMEOUT_MS;
+  time_t now = 0;
+  while (millis() < deadline) {
+    time(&now);
+    if (now > 1700000000) {
+      struct tm timeInfo;
+      if (getLocalTime(&timeInfo, 1000)) Serial.printf("[TIME] Synchronized: %04d-%02d-%02d %02d:%02d:%02d UTC\n", timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday, timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+      return true;
+    }
+    delay(250);
+  }
+  Serial.println("[TIME] NTP synchronization timed out.");
+  return false;
+}
+bool resolveControllerHost() {
+  IPAddress resolved;
+  constexpr char HOST[] = "esp32-universal-controller.onrender.com";
+  Serial.printf("[NET] Resolving %s...\n", HOST);
+  if (WiFi.hostByName(HOST, resolved) == 1) {
+    Serial.printf("[NET] DNS OK: %s -> %s\n", HOST, resolved.toString().c_str());
+    return true;
+  }
+  Serial.println("[NET] DNS FAILED.");
+  return false;
+}
 String htmlEscape(const String& value) { String out; out.reserve(value.length() + 16); for (size_t i = 0; i < value.length(); ++i) { switch (value[i]) { case '&': out += "&amp;"; break; case '<': out += "&lt;"; break; case '>': out += "&gt;"; break; case '"': out += "&quot;"; break; case '\'': out += "&#39;"; break; default: out += value[i]; break; } } return out; }
 String jsonValue(const String& json, const String& key, size_t from = 0) { const String marker = String("\"") + key + "\":\""; const int start = json.indexOf(marker, from); if (start < 0) return ""; const int valueStart = start + marker.length(); int end = valueStart; while (end < static_cast<int>(json.length())) { if (json[end] == '"' && (end == valueStart || json[end - 1] != '\\')) break; ++end; } String value = json.substring(valueStart, end); value.replace("\\\"", "\""); value.replace("\\n", "\n"); value.replace("\\r", "\r"); value.replace("\\\\", "\\"); return value; }
 }
@@ -30,7 +61,7 @@ String ControllerClient::chipIdHex() const { const uint64_t chipId = ESP.getEfus
 String ControllerClient::makeDeviceId() const { return String("esp32-") + chipIdHex(); }
 String ControllerClient::generateDeviceKey() const { static const char alphabet[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"; String key; key.reserve(48); for (int i = 0; i < 48; ++i) key += alphabet[esp_random() % (sizeof(alphabet) - 1)]; return key; }
 void ControllerClient::loadOrCreateDeviceKey() { preferences.begin(DEVICE_NS, false); deviceKey_ = preferences.getString("device_key", ""); if (deviceKey_.length() < 32) { deviceKey_ = generateDeviceKey(); preferences.putString("device_key", deviceKey_); Serial.println("[DEVICE] Generated permanent device key."); } else Serial.println("[DEVICE] Loaded existing permanent device key."); preferences.end(); }
-bool ControllerClient::connectSavedWiFi() { preferences.begin(WIFI_NS, true); const String ssid = preferences.getString("ssid", ""); const String password = preferences.getString("password", ""); preferences.end(); if (ssid.isEmpty()) return false; WiFi.mode(WIFI_STA); WiFi.begin(ssid.c_str(), password.c_str()); Serial.printf("[WIFI] Connecting to %s", ssid.c_str()); const unsigned long deadline = millis() + 15000; while (WiFi.status() != WL_CONNECTED && millis() < deadline) { delay(250); Serial.print('.'); } Serial.println(); if (WiFi.status() != WL_CONNECTED) return false; Serial.printf("[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str()); provisioningMode_ = false; return true; }
+bool ControllerClient::connectSavedWiFi() { preferences.begin(WIFI_NS, true); const String ssid = preferences.getString("ssid", ""); const String password = preferences.getString("password", ""); preferences.end(); if (ssid.isEmpty()) return false; WiFi.mode(WIFI_STA); WiFi.setAutoReconnect(true); const IPAddress dns1(1, 1, 1, 1); const IPAddress dns2(8, 8, 8, 8); WiFi.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), dns1, dns2); WiFi.begin(ssid.c_str(), password.c_str()); Serial.printf("[WIFI] Connecting to %s", ssid.c_str()); const unsigned long deadline = millis() + 15000; while (WiFi.status() != WL_CONNECTED && millis() < deadline) { delay(250); Serial.print('.'); } Serial.println(); if (WiFi.status() != WL_CONNECTED) { Serial.printf("[WIFI] Initial connection failed. Status=%d\n", WiFi.status()); return false; } Serial.printf("[WIFI] Connected. IP: %s\n", WiFi.localIP().toString().c_str()); Serial.printf("[NET] DNS1: %s | DNS2: %s\n", WiFi.dnsIP(0).toString().c_str(), WiFi.dnsIP(1).toString().c_str()); provisioningMode_ = false; syncClock(); resolveControllerHost(); return true; }
 void ControllerClient::startProvisioning() { provisioningMode_ = true; WiFi.mode(WIFI_AP_STA); const String apSsid = String(AP_PREFIX) + chipIdHex().substring(6); const String apPassword = String(AP_PASSWORD_PREFIX) + chipIdHex().substring(6); WiFi.softAP(apSsid.c_str(), apPassword.c_str()); const IPAddress apIp = WiFi.softAPIP(); dnsServer.start(DNS_PORT, "*", apIp); WiFi.scanDelete(); WiFi.scanNetworks(true, true); Serial.println("\n========== DEVICE PROVISIONING =========="); Serial.printf("Device ID : %s\n", deviceId_.c_str()); Serial.printf("Device key: %s\n", deviceKey_.c_str()); Serial.printf("Firmware  : %s\n", firmwareVersion_.c_str()); Serial.printf("Build ID  : %s\n", buildId_.c_str()); Serial.printf("Setup AP  : %s\n", apSsid.c_str()); Serial.printf("AP pass   : %s\n", apPassword.c_str()); Serial.printf("Setup URL : http://%s/\n", apIp.toString().c_str()); Serial.println("========================================="); }
 void ControllerClient::startWebServer() { webServer.on("/", HTTP_GET, [this]() { handleProvisioningRequests(); }); webServer.on("/info", HTTP_GET, [this]() { String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\"}"; webServer.send(200, "application/json", body); }); webServer.on("/save", HTTP_POST, [this]() { if (!provisioningMode_) { webServer.send(403, "text/plain", "Provisioning mode is not active."); return; } const String ssid = webServer.arg("ssid"), password = webServer.arg("password"); if (ssid.isEmpty() || ssid.length() > 32 || password.length() > 63) { webServer.send(400, "text/plain", "Invalid Wi-Fi details."); return; } preferences.begin(WIFI_NS, false); preferences.putString("ssid", ssid); preferences.putString("password", password); preferences.end(); webServer.send(200, "text/html", "<h2>Saved.</h2><p>The ESP32 is restarting and will connect to Wi-Fi.</p>"); delay(500); ESP.restart(); }); webServer.on("/scan", HTTP_GET, [this]() { WiFi.scanDelete(); WiFi.scanNetworks(true, true); webServer.sendHeader("Location", "/"); webServer.send(303); }); webServer.onNotFound([this]() { if (provisioningMode_) { webServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/"); webServer.send(302, "text/plain", "Redirecting to setup"); } else webServer.send(404, "text/plain", "Not found"); }); webServer.begin(); }
 void ControllerClient::handleProvisioningRequests() { if (!provisioningMode_) { webServer.send(200, "application/json", "{\"ok\":true}"); return; } const int count = WiFi.scanComplete(); String options = "<option value=\"\">Select a network</option>"; if (count > 0) for (int i = 0; i < count; ++i) { const String ssid = WiFi.SSID(i); if (!ssid.isEmpty()) options += "<option value=\"" + htmlEscape(ssid) + "\">" + htmlEscape(ssid) + "</option>"; } const String html = String("<!doctype html><html><meta name='viewport' content='width=device-width,initial-scale=1'><title>ESP32 LED Blink</title><body style='font-family:system-ui;max-width:520px;margin:40px auto;padding:20px'><h1>ESP32 LED Blink</h1><p>Device: <b>") + htmlEscape(deviceId_) + "</b></p><p>Firmware: <b>" + htmlEscape(firmwareVersion_) + "</b></p><p>Device key is available in Serial Monitor.</p><form method='post' action='/save'><label>Wi-Fi</label><br><select name='ssid' style='width:100%;padding:12px'>" + options + "</select><br><br><label>Password</label><br><input name='password' type='password' style='width:100%;padding:12px'><br><button style='margin-top:16px;padding:12px;width:100%'>Connect</button></form><form method='get' action='/scan'><button style='margin-top:10px;padding:12px;width:100%'>Scan again</button></form></body></html>"; webServer.send(200, "text/html", html); }
@@ -52,12 +83,14 @@ void ControllerClient::processCommands(const String& json) {
 bool ControllerClient::performOta(const String& commandId, const String& tag, const String& version) {
   if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); return false; }
   auto reportProgress = [&](const char* state, int percent, size_t downloaded, size_t total, const String& detail) {
-    HTTPClient progressHttp; const String progressUrl = controllerUrl_ + "/api/device/ota-progress"; if (!progressHttp.begin(progressUrl)) return; progressHttp.setConnectTimeout(5000); progressHttp.setTimeout(5000); progressHttp.addHeader("Content-Type", "application/json"); progressHttp.addHeader("X-Device-Key", deviceKey_);
+    WiFiClientSecure progressClient; progressClient.setInsecure();
+    HTTPClient progressHttp; const String progressUrl = controllerUrl_ + "/api/device/ota-progress"; if (!progressHttp.begin(progressClient, progressUrl)) return; progressHttp.setConnectTimeout(5000); progressHttp.setTimeout(5000); progressHttp.addHeader("Content-Type", "application/json"); progressHttp.addHeader("X-Device-Key", deviceKey_);
     String body = "{\"deviceId\":\"" + deviceId_ + "\",\"commandId\":\"" + commandId + "\",\"status\":\"" + String(state) + "\",\"percent\":" + String(percent) + ",\"downloaded\":" + String(downloaded) + ",\"total\":" + String(total) + ",\"tag\":\"" + tag + "\",\"message\":\"" + detail + "\"}";
-    progressHttp.POST(body); progressHttp.end();
+    const int progressStatus = progressHttp.POST(body); Serial.printf("[OTA] Progress report: %s %d%% HTTP %d\n", state, percent, progressStatus); progressHttp.end();
   };
 
-  HTTPClient http; const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_; Serial.printf("[OTA] Downloading: %s\n", url.c_str()); if (!http.begin(url)) { Serial.println("[OTA] HTTP initialization failed."); return false; }
+  WiFiClientSecure secureClient; secureClient.setInsecure();
+  HTTPClient http; const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_; Serial.printf("[OTA] Downloading: %s\n", url.c_str()); if (!http.begin(secureClient, url)) { Serial.println("[OTA] HTTP initialization failed."); return false; }
   http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_); const int status = http.GET(); if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return false; }
   const int contentLength = http.getSize(); Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength); if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
   WiFiClient* stream = http.getStreamPtr(); const size_t total = static_cast<size_t>(contentLength); size_t downloaded = 0; int lastBucket = -1; uint8_t buffer[2048]; reportProgress("downloading", 0, 0, total, "Firmware download started");
@@ -66,8 +99,16 @@ bool ControllerClient::performOta(const String& commandId, const String& tag, co
   reportProgress("installing", 100, downloaded, total, "Firmware written successfully; installing"); delay(250); reportProgress("rebooting", 100, downloaded, total, "Restarting into the new firmware"); Serial.println("[OTA] Update complete. Restarting..."); delay(250); ESP.restart(); return true;
 }
 
-void ControllerClient::sendHeartbeat() { if (provisioningMode_ || WiFi.status() != WL_CONNECTED) return; if (lastHeartbeatAt_ != 0 && millis() - lastHeartbeatAt_ < HEARTBEAT_INTERVAL_MS) return; lastHeartbeatAt_ = millis(); HTTPClient http; const String url = controllerUrl_ + "/api/device/heartbeat"; if (!http.begin(url)) { Serial.println("[HEARTBEAT] HTTP begin failed; retrying soon."); lastHeartbeatAt_ = 0; return; } http.setConnectTimeout(10000); http.setTimeout(10000); http.addHeader("Content-Type", "application/json"); http.addHeader("X-Device-Key", deviceKey_); http.addHeader("User-Agent", "ESP32-LED-Blink-Central-Test/" + firmwareVersion_); String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis()); if (pendingAcks_.length()) { body += ",\"commandAcks\":[" + pendingAcks_ + "]"; pendingAcks_.clear(); } body += "}"; Serial.printf("[HEARTBEAT] POST %s\n", url.c_str()); const int status = http.POST(body); const String response = http.getString(); if (status == HTTP_CODE_OK) { Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); } else { Serial.printf("[HEARTBEAT] FAILED HTTP %d | %s\n", status, response.c_str()); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); } http.end(); }
-void ControllerClient::loop() { if (provisioningMode_) dnsServer.processNextRequest(); webServer.handleClient(); if (WiFi.status() == WL_CONNECTED) sendHeartbeat(); else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); WiFi.reconnect(); } }
+void ControllerClient::sendHeartbeat() {
+  if (provisioningMode_ || WiFi.status() != WL_CONNECTED) return; if (lastHeartbeatAt_ != 0 && millis() - lastHeartbeatAt_ < HEARTBEAT_INTERVAL_MS) return; lastHeartbeatAt_ = millis();
+  if (!resolveControllerHost()) { Serial.println("[HEARTBEAT] DNS unavailable; retrying soon."); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); return; }
+  WiFiClientSecure secureClient; secureClient.setInsecure(); HTTPClient http; const String url = controllerUrl_ + "/api/device/heartbeat";
+  if (!http.begin(secureClient, url)) { Serial.println("[HEARTBEAT] HTTPS begin failed; retrying soon."); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); return; }
+  http.setConnectTimeout(10000); http.setTimeout(10000); http.addHeader("Content-Type", "application/json"); http.addHeader("X-Device-Key", deviceKey_); http.addHeader("User-Agent", "ESP32-LED-Blink-Central-Test/" + firmwareVersion_);
+  String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis()); if (pendingAcks_.length()) { body += ",\"commandAcks\":[" + pendingAcks_ + "]"; pendingAcks_.clear(); } body += "}";
+  Serial.printf("[HEARTBEAT] POST %s\n", url.c_str()); const int status = http.POST(body); const String response = http.getString(); if (status == HTTP_CODE_OK) { Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); } else { Serial.printf("[HEARTBEAT] FAILED HTTP %d | %s\n", status, response.c_str()); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); } http.end();
+}
+void ControllerClient::loop() { if (provisioningMode_) dnsServer.processNextRequest(); webServer.handleClient(); if (WiFi.status() == WL_CONNECTED) sendHeartbeat(); else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); Serial.println("[WIFI] Disconnected. Retrying saved Wi-Fi..."); WiFi.reconnect(); } }
 bool ControllerClient::provisioningMode() const { return provisioningMode_; }
 const String& ControllerClient::deviceId() const { return deviceId_; }
 const String& ControllerClient::deviceKey() const { return deviceKey_; }
