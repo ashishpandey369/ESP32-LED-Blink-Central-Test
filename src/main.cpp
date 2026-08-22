@@ -8,23 +8,24 @@
 #define UEC_CONTROLLER_URL "https://esp32-universal-controller.onrender.com"
 #endif
 #ifndef UEC_FIRMWARE_VERSION
-#define UEC_FIRMWARE_VERSION "0.1.0"
+#define UEC_FIRMWARE_VERSION "0.5.2"
 #endif
 #ifndef UEC_BUILD_ID
-#define UEC_BUILD_ID "led-blink-central-test::0.1.0"
+#define UEC_BUILD_ID "led-blink-central-test::0.5.2"
 #endif
 #ifndef UEC_BLINK_INTERVAL_MS
 #define UEC_BLINK_INTERVAL_MS 1000
 #endif
 
-constexpr uint8_t LED_PIN = 2;
+constexpr uint8_t LED_D2_PIN = 2;
+constexpr uint8_t LED_D4_PIN = 4;
 constexpr unsigned long BLINK_INTERVAL_MS = UEC_BLINK_INTERVAL_MS;
 constexpr char APP_STATE_NAMESPACE[] = "uc_app_state";
 
 ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
 Preferences appStatePreferences;
-bool ledState = false;
 bool deviceEnabled = true;
+bool d2Active = true;
 unsigned long lastBlinkAt = 0;
 
 void loadDeviceEnabledState() {
@@ -42,8 +43,9 @@ void setDeviceEnabled(bool enabled) {
   lastBlinkAt = millis();
 
   if (!deviceEnabled) {
-    ledState = false;
-    digitalWrite(LED_PIN, LOW);
+    d2Active = true;
+    digitalWrite(LED_D2_PIN, LOW);
+    digitalWrite(LED_D4_PIN, LOW);
   }
 
   Serial.printf("[DEVICE] Remote application control -> %s\n", deviceEnabled ? "ENABLED" : "DISABLED");
@@ -59,8 +61,10 @@ void controllerTask(void*) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(LED_D2_PIN, OUTPUT);
+  pinMode(LED_D4_PIN, OUTPUT);
+  digitalWrite(LED_D2_PIN, LOW);
+  digitalWrite(LED_D4_PIN, LOW);
   loadDeviceEnabledState();
 
   Serial.println();
@@ -68,7 +72,7 @@ void setup() {
   Serial.println(" ESP32 LED Blink - Central Test Project");
   Serial.println("========================================");
   Serial.printf("[FW] Version: %s | Build: %s | Hardware: esp32\n", UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
-  Serial.printf("[APP] LED GPIO: %u | Blink interval: %lu ms\n", LED_PIN, BLINK_INTERVAL_MS);
+  Serial.printf("[APP] LED pins: D2=%u, D4=%u | Alternating interval: %lu ms\n", LED_D2_PIN, LED_D4_PIN, BLINK_INTERVAL_MS);
   controller.begin();
 
   xTaskCreatePinnedToCore(
@@ -108,9 +112,10 @@ void loop() {
   const unsigned long now = millis();
   if (now - lastBlinkAt >= BLINK_INTERVAL_MS) {
     lastBlinkAt = now;
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    Serial.printf("[LED] GPIO %u -> %s\n", LED_PIN, ledState ? "ON" : "OFF");
+    d2Active = !d2Active;
+    digitalWrite(LED_D2_PIN, d2Active ? HIGH : LOW);
+    digitalWrite(LED_D4_PIN, d2Active ? LOW : HIGH);
+    Serial.printf("[LED] D2 -> %s | D4 -> %s\n", d2Active ? "ON" : "OFF", d2Active ? "OFF" : "ON");
   }
 
   delay(1);
