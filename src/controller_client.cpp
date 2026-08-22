@@ -9,6 +9,7 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -25,6 +26,7 @@ constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 constexpr unsigned long NTP_SYNC_TIMEOUT_MS = 10000;
 constexpr unsigned long OTA_NO_PROGRESS_TIMEOUT_MS = 60000;
 constexpr unsigned long OTA_STREAM_READ_TIMEOUT_MS = 1000;
+constexpr uint32_t OTA_TASK_STACK_SIZE = 8192;
 DNSServer dnsServer;
 WebServer webServer(HTTP_PORT);
 Preferences preferences;
@@ -122,9 +124,17 @@ void reportOtaProgress(const OtaTaskContext& ctx, const char* state, int percent
   progressHttp.end();
 }
 
+void finishOtaTask(OtaTaskContext* ctx) {
+  otaRunning = false;
+  otaCommandId.clear();
+  delete ctx;
+  vTaskDelete(nullptr);
+}
+
 void otaTask(void* parameter) {
   OtaTaskContext* ctx = static_cast<OtaTaskContext*>(parameter);
   Serial.printf("[OTA] Background task started: command=%s version=%s\n", ctx->commandId.c_str(), ctx->version.c_str());
+  Serial.printf("[OTA] Free heap: %u | Min free heap: %u | Largest block: %u\n", ESP.getFreeHeap(), ESP.getMinFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
   const String url = ctx->controllerUrl + "/api/device/firmware/download/" + ctx->tag + "?deviceId=" + ctx->deviceId;
   Serial.printf("[OTA] Downloading: %s\n", url.c_str());
@@ -137,9 +147,7 @@ void otaTask(void* parameter) {
   http.setTimeout(OTA_STREAM_READ_TIMEOUT_MS);
   if (!http.begin(secureClient, url)) {
     reportOtaProgress(*ctx, "failed", 0, 0, 0, "HTTP initialization failed");
-    otaRunning = false;
-    delete ctx;
-    vTaskDelete(nullptr);
+    finishOtaTask(ctx);
     return;
   }
   http.addHeader("X-Device-Key", ctx->deviceKey);
@@ -148,21 +156,17 @@ void otaTask(void* parameter) {
     Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str());
     reportOtaProgress(*ctx, "failed", 0, 0, 0, String("Firmware download HTTP ") + String(status));
     http.end();
-    otaRunning = false;
-    delete ctx;
-    vTaskDelete(nullptr);
+    finishOtaTask(ctx);
     return;
   }
 
   const int contentLength = http.getSize();
   Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength);
   if (contentLength <= 0 || !Update.begin(static_cast<size_t>(contentLength))) {
-    Serial.println("[OTA] Invalid firmware size or Update.begin failed.");
+    Serial.printf("[OTA] Invalid firmware size or Update.begin failed. Update error=%d | Free heap=%u | Largest block=%u\n", static_cast<int>(Update.getError()), ESP.getFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     reportOtaProgress(*ctx, "failed", 0, 0, contentLength > 0 ? static_cast<size_t>(contentLength) : 0, "Invalid firmware size or insufficient OTA space");
     http.end();
-    otaRunning = false;
-    delete ctx;
-    vTaskDelete(nullptr);
+    finishOtaTask(ctx);
     return;
   }
 
@@ -212,7 +216,7 @@ void otaTask(void* parameter) {
       Serial.printf("[OTA] Download progress: %d%% | %u/%u bytes\n", percent, static_cast<unsigned>(downloaded), static_cast<unsigned>(total));
       lastBucket = bucket;
     }
-    yield();
+    vTaskDelay(1);
   }
 
   const bool valid = writeOk && downloaded == total && Update.end(true);
@@ -222,9 +226,7 @@ void otaTask(void* parameter) {
     const int percent = total ? static_cast<int>((downloaded * 100ULL) / total) : 0;
     const String detail = downloaded < total ? "Firmware download stalled for 60 seconds" : "Firmware image write failed";
     reportOtaProgress(*ctx, "failed", percent, downloaded, total, detail);
-    otaRunning = false;
-    delete ctx;
-    vTaskDelete(nullptr);
+    finishOtaTask(ctx);
     return;
   }
 
@@ -250,12 +252,14 @@ void ControllerClient::begin() { deviceId_ = makeDeviceId(); loadOrCreateDeviceK
 void ControllerClient::queueAck(const String& id, const char* status, const String& result) { if (id.isEmpty()) return; if (pendingAcks_.length()) pendingAcks_ += ','; pendingAcks_ += "{\"id\":\"" + id + "\",\"status\":\"" + String(status) + "\",\"result\":\"" + result + "\"}"; }
 
 void ControllerClient::processCommands(const String& json) {
-  const int commandsStart = json.indexOf("\"commands\":["); if (commandsStart < 0) return; int cursor = commandsStart;
+  const int commandsStart = json.indexOf("\"commands\":["); if (commandsStart < 0) return; int cursor = commandsStart; bool otaCommandSeen = false;
   while (true) {
     const int idPos = json.indexOf("\"id\":\"", cursor); if (idPos < 0) break; const String id = jsonValue(json, "id", idPos); const int typePos = json.indexOf("\"type\":\"", idPos); if (typePos < 0) break; const String type = jsonValue(json, "type", typePos); const int nextCommand = json.indexOf("{\"id\":\"", typePos + 8); const int commandEnd = nextCommand >= 0 ? nextCommand : json.length(); const String commandJson = json.substring(idPos, commandEnd);
     Serial.printf("[COMMAND] Received id=%s type=%s\n", id.c_str(), type.c_str());
     if (type == "message") { const int payloadPos = commandJson.indexOf("\"payload\":{"); const String msg = payloadPos >= 0 ? jsonValue(commandJson, "message", payloadPos) : jsonValue(commandJson, "message", typePos - idPos); if (!msg.isEmpty()) { pendingMessage_ = msg; Serial.printf("[COMMAND] Remote message: %s\n", pendingMessage_.c_str()); queueAck(id, "executed", "message_received"); } else queueAck(id, "failed", "missing_message"); }
     else if (type == "ota") {
+      if (otaCommandSeen) { Serial.printf("[OTA] Ignoring additional OTA command in the same heartbeat: %s\n", id.c_str()); if (nextCommand < 0) break; cursor = nextCommand; continue; }
+      otaCommandSeen = true;
       const int payloadPos = commandJson.indexOf("\"payload\":{");
       const String tag = payloadPos >= 0 ? jsonValue(commandJson, "tag", payloadPos) : jsonValue(commandJson, "tag");
       const String version = payloadPos >= 0 ? jsonValue(commandJson, "version", payloadPos) : jsonValue(commandJson, "version");
@@ -265,13 +269,23 @@ void ControllerClient::processCommands(const String& json) {
       else if (otaRunning) { Serial.printf("[OTA] OTA already running (command=%s); ignoring duplicate command=%s\n", otaCommandId.c_str(), id.c_str()); }
       else {
         OtaTaskContext* context = new OtaTaskContext{controllerUrl_, deviceId_, deviceKey_, id, tag, version};
-        if (!context) { queueAck(id, "failed", "unable_to_allocate_ota_context"); }
+        if (!context) { Serial.printf("[OTA] Context allocation failed. Free heap=%u | Min free heap=%u | Largest block=%u\n", ESP.getFreeHeap(), ESP.getMinFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)); }
         else {
+          const uint32_t freeHeapBeforeTask = ESP.getFreeHeap();
+          const uint32_t largestBlockBeforeTask = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
           otaCommandId = id;
           otaRunning = true;
-          const BaseType_t created = xTaskCreatePinnedToCore(otaTask, "ota_update", 12288, context, 1, nullptr, 0);
-          if (created != pdPASS) { otaRunning = false; otaCommandId.clear(); delete context; queueAck(id, "failed", "unable_to_start_ota_task"); Serial.println("[OTA] Failed to create background OTA task."); }
-          else Serial.printf("[OTA] Background OTA task created for command=%s\n", id.c_str());
+          TaskHandle_t otaHandle = nullptr;
+          const BaseType_t created = xTaskCreatePinnedToCore(otaTask, "ota_update", OTA_TASK_STACK_SIZE, context, 1, &otaHandle, 0);
+          if (created != pdPASS) {
+            otaRunning = false;
+            otaCommandId.clear();
+            delete context;
+            Serial.printf("[OTA] Failed to create background OTA task. Free heap=%u | Min free heap=%u | Largest block=%u | Before task: free=%u largest=%u\n", ESP.getFreeHeap(), ESP.getMinFreeHeap(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), freeHeapBeforeTask, largestBlockBeforeTask);
+            queueAck(id, "failed", "unable_to_start_ota_task");
+          } else {
+            Serial.printf("[OTA] Background OTA task created for command=%s | stack=%u | Free heap=%u\n", id.c_str(), OTA_TASK_STACK_SIZE, ESP.getFreeHeap());
+          }
         }
       }
     }
