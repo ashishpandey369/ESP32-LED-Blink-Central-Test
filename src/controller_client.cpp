@@ -93,37 +93,34 @@ bool ControllerClient::performOta(const String& commandId, const String& tag, co
   HTTPClient http; const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_; Serial.printf("[OTA] Downloading: %s\n", url.c_str()); if (!http.begin(secureClient, url)) { Serial.println("[OTA] HTTP initialization failed."); return false; }
   http.setConnectTimeout(10000); http.setTimeout(30000); http.addHeader("X-Device-Key", deviceKey_); const int status = http.GET(); if (status != HTTP_CODE_OK) { Serial.printf("[OTA] Download failed: HTTP %d | %s\n", status, http.getString().c_str()); http.end(); return false; }
   const int contentLength = http.getSize(); Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength); if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
-  WiFiClient* stream = http.getStreamPtr(); const size_t total = static_cast<size_t>(contentLength); size_t downloaded = 0; int lastBucket = -1; uint8_t buffer[2048]; reportProgress("downloading", 0, 0, total, "Firmware download started");
+  WiFiClient* stream = http.getStreamPtr(); const size_t total = static_cast<size_t>(contentLength); size_t downloaded = 0; int lastBucket = -1; int emptyReads = 0; uint8_t buffer[2048]; reportProgress("downloading", 0, 0, total, "Firmware download started");
   while (downloaded < total) {
     const size_t remaining = total - downloaded;
     const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
     const size_t count = stream->readBytes(buffer, want);
-
     if (count == 0) {
-      Serial.printf("[OTA] DIAGNOSTIC: stream->readBytes returned 0 | downloaded=%u/%u | requested=%u\n",
-                    static_cast<unsigned>(downloaded),
-                    static_cast<unsigned>(total),
-                    static_cast<unsigned>(want));
-      Update.abort();
-      http.end();
-      reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware download stream returned 0 bytes");
-      return false;
+      ++emptyReads;
+      Serial.printf("[OTA] Download stream temporarily empty (%d/5) | downloaded=%u/%u\n", emptyReads, static_cast<unsigned>(downloaded), static_cast<unsigned>(total));
+      if (emptyReads >= 5) {
+        Serial.println("[OTA] Download stream timeout after 5 retries.");
+        Update.abort();
+        http.end();
+        reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware download stream timed out");
+        return false;
+      }
+      delay(100);
+      yield();
+      continue;
     }
-
+    emptyReads = 0;
     const size_t written = Update.write(buffer, count);
     if (written != count) {
-      Serial.printf("[OTA] DIAGNOSTIC: Update.write mismatch | downloaded=%u/%u | read=%u | written=%u | update_error=%d\n",
-                    static_cast<unsigned>(downloaded),
-                    static_cast<unsigned>(total),
-                    static_cast<unsigned>(count),
-                    static_cast<unsigned>(written),
-                    static_cast<int>(Update.getError()));
+      Serial.printf("[OTA] DIAGNOSTIC: Update.write mismatch | downloaded=%u/%u | read=%u | written=%u | update_error=%d\n", static_cast<unsigned>(downloaded), static_cast<unsigned>(total), static_cast<unsigned>(count), static_cast<unsigned>(written), static_cast<int>(Update.getError()));
       Update.abort();
       http.end();
       reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware image write failed");
       return false;
     }
-
     downloaded += count;
     const int percent = static_cast<int>((downloaded * 100ULL) / total);
     const int bucket = percent / 10;
