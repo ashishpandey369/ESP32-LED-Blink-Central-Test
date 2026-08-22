@@ -30,6 +30,7 @@ WebServer webServer(HTTP_PORT);
 Preferences preferences;
 volatile bool otaRunning = false;
 String otaCommandId;
+bool recoveryPortalActive = false;
 
 bool syncClock() {
   Serial.println("[TIME] Synchronizing clock...");
@@ -293,7 +294,35 @@ void ControllerClient::sendHeartbeat() {
   String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis()); if (pendingAcks_.length()) { body += ",\"commandAcks\":[" + pendingAcks_ + "]"; pendingAcks_.clear(); } body += "}";
   Serial.printf("[HEARTBEAT] POST %s\n", url.c_str()); const int status = http.POST(body); const String response = http.getString(); if (status == HTTP_CODE_OK) { Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); } else { Serial.printf("[HEARTBEAT] FAILED HTTP %d | %s\n", status, response.c_str()); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); } http.end();
 }
-void ControllerClient::loop() { if (provisioningMode_) dnsServer.processNextRequest(); webServer.handleClient(); if (WiFi.status() == WL_CONNECTED) sendHeartbeat(); else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); Serial.println("[WIFI] Disconnected. Retrying saved Wi-Fi..."); WiFi.reconnect(); } }
+void ControllerClient::loop() {
+  if (provisioningMode_) dnsServer.processNextRequest();
+  webServer.handleClient();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (recoveryPortalActive) {
+      Serial.println("[WIFI] Reconnected. Closing recovery portal and resuming controller.");
+      recoveryPortalActive = false;
+      provisioningMode_ = false;
+      dnsServer.stop();
+      WiFi.softAPdisconnect(true);
+      syncClock();
+      resolveControllerHost();
+    }
+    sendHeartbeat();
+  } else if (!provisioningMode_ || recoveryPortalActive) {
+    if (!recoveryPortalActive) {
+      Serial.println("[WIFI] Disconnected. Starting local Wi-Fi recovery portal while reconnecting...");
+      startProvisioning();
+      recoveryPortalActive = true;
+      Serial.printf("[WIFI] Recovery portal: connect to %s and open http://%s/\n", (String(AP_PREFIX) + chipIdHex().substring(6)).c_str(), WiFi.softAPIP().toString().c_str());
+    }
+    if (millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) {
+      lastWiFiRetryAt_ = millis();
+      Serial.println("[WIFI] Retrying saved Wi-Fi in background...");
+      WiFi.reconnect();
+    }
+  }
+}
 bool ControllerClient::provisioningMode() const { return provisioningMode_; }
 const String& ControllerClient::deviceId() const { return deviceId_; }
 const String& ControllerClient::deviceKey() const { return deviceKey_; }
