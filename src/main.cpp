@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "controller_client.h"
@@ -18,10 +19,35 @@
 
 constexpr uint8_t LED_PIN = 2;
 constexpr unsigned long BLINK_INTERVAL_MS = UEC_BLINK_INTERVAL_MS;
+constexpr char APP_STATE_NAMESPACE[] = "uc_app_state";
 
 ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
+Preferences appStatePreferences;
 bool ledState = false;
+bool deviceEnabled = true;
 unsigned long lastBlinkAt = 0;
+
+void loadDeviceEnabledState() {
+  appStatePreferences.begin(APP_STATE_NAMESPACE, true);
+  deviceEnabled = appStatePreferences.getBool("enabled", true);
+  appStatePreferences.end();
+  Serial.printf("[DEVICE] Application state: %s\n", deviceEnabled ? "ENABLED" : "DISABLED");
+}
+
+void setDeviceEnabled(bool enabled) {
+  deviceEnabled = enabled;
+  appStatePreferences.begin(APP_STATE_NAMESPACE, false);
+  appStatePreferences.putBool("enabled", deviceEnabled);
+  appStatePreferences.end();
+  lastBlinkAt = millis();
+
+  if (!deviceEnabled) {
+    ledState = false;
+    digitalWrite(LED_PIN, LOW);
+  }
+
+  Serial.printf("[DEVICE] Remote application control -> %s\n", deviceEnabled ? "ENABLED" : "DISABLED");
+}
 
 void controllerTask(void*) {
   for (;;) {
@@ -35,6 +61,7 @@ void setup() {
   delay(500);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  loadDeviceEnabledState();
 
   Serial.println();
   Serial.println("========================================");
@@ -59,20 +86,31 @@ void setup() {
 }
 
 void loop() {
+  String remoteMessage;
+  if (controller.consumeMessage(remoteMessage)) {
+    if (remoteMessage == "__UC_DEVICE_ENABLE__") {
+      setDeviceEnabled(true);
+    } else if (remoteMessage == "__UC_DEVICE_DISABLE__") {
+      setDeviceEnabled(false);
+    } else {
+      Serial.println("----------------------------------------");
+      Serial.println("REMOTE MESSAGE FROM CONTROLLER:");
+      Serial.println(remoteMessage);
+      Serial.println("----------------------------------------");
+    }
+  }
+
+  if (!deviceEnabled) {
+    delay(1);
+    return;
+  }
+
   const unsigned long now = millis();
   if (now - lastBlinkAt >= BLINK_INTERVAL_MS) {
     lastBlinkAt = now;
     ledState = !ledState;
     digitalWrite(LED_PIN, ledState ? HIGH : LOW);
     Serial.printf("[LED] GPIO %u -> %s\n", LED_PIN, ledState ? "ON" : "OFF");
-  }
-
-  String remoteMessage;
-  if (controller.consumeMessage(remoteMessage)) {
-    Serial.println("----------------------------------------");
-    Serial.println("REMOTE MESSAGE FROM CONTROLLER:");
-    Serial.println(remoteMessage);
-    Serial.println("----------------------------------------");
   }
 
   delay(1);
