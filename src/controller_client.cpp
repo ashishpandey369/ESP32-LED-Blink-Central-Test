@@ -58,9 +58,7 @@ void ControllerClient::processCommands(const String& json) {
     const int nextCommand = json.indexOf("{\"id\":\"", typePos + 8);
     const int commandEnd = nextCommand >= 0 ? nextCommand : json.length();
     const String commandJson = json.substring(idPos, commandEnd);
-
     Serial.printf("[COMMAND] Received id=%s type=%s\n", id.c_str(), type.c_str());
-
     if (type == "message") {
       const int payloadPos = commandJson.indexOf("\"payload\":{");
       const String message = payloadPos >= 0 ? jsonValue(commandJson, "message", payloadPos) : jsonValue(commandJson, "message", typePos - idPos);
@@ -74,10 +72,7 @@ void ControllerClient::processCommands(const String& json) {
       if (tag.isEmpty()) { Serial.println("[OTA] Command missing payload.tag"); queueAck(id, "failed", "missing_tag"); }
       else if (performOta(tag, version)) return;
       else queueAck(id, "failed", "ota_failed");
-    } else {
-      queueAck(id, "rejected", "unsupported_command");
-    }
-
+    } else queueAck(id, "rejected", "unsupported_command");
     if (nextCommand < 0) break;
     cursor = nextCommand;
   }
@@ -85,6 +80,16 @@ void ControllerClient::processCommands(const String& json) {
 
 bool ControllerClient::performOta(const String& tag, const String& version) {
   if (version == firmwareVersion_) { Serial.println("[OTA] Already running requested version."); return false; }
+
+  auto reportProgress = [&](const char* state, int percent, size_t downloaded, size_t total, const String& detail) {
+    HTTPClient progressHttp;
+    const String progressUrl = controllerUrl_ + "/api/device/ota-progress";
+    if (!progressHttp.begin(progressUrl)) return;
+    progressHttp.setConnectTimeout(5000); progressHttp.setTimeout(5000); progressHttp.addHeader("Content-Type", "application/json"); progressHttp.addHeader("X-Device-Key", deviceKey_);
+    String body = "{\"deviceId\":\"" + deviceId_ + "\",\"commandId\":\"\"\,\"status\":\"" + String(state) + "\",\"percent\":" + String(percent) + ",\"downloaded\":" + String(downloaded) + ",\"total\":" + String(total) + ",\"tag\":\"" + tag + "\",\"message\":\"" + detail + "\"}";
+    progressHttp.POST(body); progressHttp.end();
+  };
+
   HTTPClient http;
   const String url = controllerUrl_ + "/api/device/firmware/download/" + tag + "?deviceId=" + deviceId_;
   Serial.printf("[OTA] Downloading: %s\n", url.c_str());
@@ -95,10 +100,36 @@ bool ControllerClient::performOta(const String& tag, const String& version) {
   const int contentLength = http.getSize();
   Serial.printf("[OTA] HTTP 200 | firmware size=%d bytes\n", contentLength);
   if (contentLength <= 0 || !Update.begin(contentLength)) { Serial.println("[OTA] Invalid firmware size or Update.begin failed."); http.end(); return false; }
-  WiFiClient* stream = http.getStreamPtr(); const size_t written = Update.writeStream(*stream);
-  Serial.printf("[OTA] Written %u / %d bytes\n", static_cast<unsigned>(written), contentLength);
-  if (written != static_cast<size_t>(contentLength) || !Update.end(true)) { Serial.printf("[OTA] Update failed. Error=%u\n", Update.getError()); Update.abort(); http.end(); return false; }
-  Serial.println("[OTA] Update complete. Restarting..."); http.end(); delay(500); ESP.restart(); return true;
+
+  WiFiClient* stream = http.getStreamPtr();
+  const size_t total = static_cast<size_t>(contentLength);
+  size_t downloaded = 0;
+  int lastReportedBucket = -1;
+  uint8_t buffer[2048];
+  reportProgress("downloading", 0, 0, total, "Firmware download started");
+
+  while (downloaded < total) {
+    const size_t remaining = total - downloaded;
+    const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+    const size_t count = stream->readBytes(buffer, want);
+    if (count == 0 || Update.write(buffer, count) != count) { Update.abort(); http.end(); reportProgress("failed", total ? static_cast<int>((downloaded * 100ULL) / total) : 0, downloaded, total, "Firmware image write failed"); return false; }
+    downloaded += count;
+    const int percent = static_cast<int>((downloaded * 100ULL) / total);
+    const int bucket = percent / 5;
+    if (bucket != lastReportedBucket || downloaded == total) { reportProgress("downloading", percent, downloaded, total, "Downloading firmware"); lastReportedBucket = bucket; }
+    yield();
+  }
+
+  const bool valid = Update.end(true);
+  http.end();
+  if (!valid) { Update.abort(); reportProgress("failed", 100, downloaded, total, "Firmware verification failed"); return false; }
+  reportProgress("installing", 100, downloaded, total, "Firmware written successfully; installing");
+  delay(250);
+  reportProgress("rebooting", 100, downloaded, total, "Restarting into the new firmware");
+  Serial.println("[OTA] Update complete. Restarting...");
+  delay(250);
+  ESP.restart();
+  return true;
 }
 
 void ControllerClient::sendHeartbeat() {
