@@ -1,0 +1,49 @@
+name: Apply OTA stream timeout fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply targeted OTA fix and remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/controller_client.cpp')
+          text = path.read_text(encoding='utf-8')
+
+          old_timeout = 'constexpr unsigned long OTA_STREAM_READ_TIMEOUT_MS = 10000;'
+          new_timeout = 'constexpr unsigned long OTA_STREAM_READ_TIMEOUT_MS = 1000;'
+          if old_timeout not in text:
+              raise SystemExit('Expected OTA stream timeout line not found')
+          text = text.replace(old_timeout, new_timeout, 1)
+
+          old_yield = '''      yield();\n      continue;\n    }'''
+          new_yield = '''      vTaskDelay(pdMS_TO_TICKS(10));\n      continue;\n    }'''
+          if old_yield not in text:
+              raise SystemExit('Expected OTA stream-wait yield block not found')
+          text = text.replace(old_yield, new_yield, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+          rm -f .github/workflows/apply-ota-read-timeout-fix.yml
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/controller_client.cpp .github/workflows/apply-ota-read-timeout-fix.yml
+          git commit -m "Fix OTA stream wait watchdog behavior"
+          git push
