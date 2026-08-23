@@ -11,6 +11,7 @@
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 
 namespace {
 constexpr uint16_t DNS_PORT = 53;
@@ -30,6 +31,40 @@ WebServer webServer(HTTP_PORT);
 Preferences preferences;
 volatile bool otaRunning = false;
 String otaCommandId;
+
+// OTA progress reporter queue and task
+QueueHandle_t otaProgressQueue = NULL;
+TaskHandle_t otaProgressReporterHandle = NULL;
+
+struct ProgressEvent {
+  String controllerUrl;
+  String deviceId;
+  String deviceKey;
+  String commandId;
+  String tag;
+  String state;
+  int percent;
+  size_t downloaded;
+  size_t total;
+  String message;
+};
+
+// Ensure the OTA progress reporter task and queue exist
+static void otaProgressReporterTask(void* parameter);
+static void ensureOtaProgressReporter() {
+  if (otaProgressQueue) return;
+  otaProgressQueue = xQueueCreate(8, sizeof(void*));
+  if (!otaProgressQueue) {
+    Serial.println("[OTA] Unable to create progress queue");
+    return;
+  }
+  const BaseType_t created = xTaskCreatePinnedToCore(otaProgressReporterTask, "ota_progress", 8192, NULL, 1, &otaProgressReporterHandle, 1);
+  if (created != pdPASS) {
+    Serial.println("[OTA] Failed to create progress reporter task");
+    vQueueDelete(otaProgressQueue);
+    otaProgressQueue = NULL;
+  }
+}
 
 bool syncClock() {
   Serial.println("[TIME] Synchronizing clock...");
@@ -106,19 +141,58 @@ struct OtaTaskContext {
 
 void reportOtaProgress(const OtaTaskContext& ctx, const char* state, int percent, size_t downloaded, size_t total, const String& detail) {
   if (WiFi.status() != WL_CONNECTED || ctx.controllerUrl.isEmpty() || ctx.commandId.isEmpty()) return;
-  WiFiClientSecure progressClient;
-  progressClient.setInsecure();
-  HTTPClient progressHttp;
-  const String progressUrl = ctx.controllerUrl + "/api/device/ota-progress";
-  if (!progressHttp.begin(progressClient, progressUrl)) return;
-  progressHttp.setConnectTimeout(5000);
-  progressHttp.setTimeout(5000);
-  progressHttp.addHeader("Content-Type", "application/json");
-  progressHttp.addHeader("X-Device-Key", ctx.deviceKey);
-  String body = "{\"deviceId\":\"" + ctx.deviceId + "\",\"commandId\":\"" + ctx.commandId + "\",\"status\":\"" + String(state) + "\",\"percent\":" + String(percent) + ",\"downloaded\":" + String(downloaded) + ",\"total\":" + String(total) + ",\"tag\":\"" + ctx.tag + "\",\"message\":\"" + detail + "\"}";
-  const int status = progressHttp.POST(body);
-  Serial.printf("[OTA] Progress report: %s %d%% HTTP %d\n", state, percent, status);
-  progressHttp.end();
+  ensureOtaProgressReporter();
+  if (!otaProgressQueue) return;
+  ProgressEvent* ev = new ProgressEvent();
+  if (!ev) return;
+  ev->controllerUrl = ctx.controllerUrl;
+  ev->deviceId = ctx.deviceId;
+  ev->deviceKey = ctx.deviceKey;
+  ev->commandId = ctx.commandId;
+  ev->tag = ctx.tag;
+  ev->state = String(state);
+  ev->percent = percent;
+  ev->downloaded = downloaded;
+  ev->total = total;
+  ev->message = detail;
+  void* ptr = static_cast<void*>(ev);
+  if (xQueueSend(otaProgressQueue, &ptr, (TickType_t)(100 / portTICK_PERIOD_MS)) != pdTRUE) {
+    Serial.println("[OTA] Progress queue full; dropping progress event");
+    delete ev;
+  }
+}
+
+static void otaProgressReporterTask(void* parameter) {
+  (void)parameter;
+  for (;;) {
+    void* item = NULL;
+    if (xQueueReceive(otaProgressQueue, &item, portMAX_DELAY) == pdTRUE) {
+      ProgressEvent* ev = static_cast<ProgressEvent*>(item);
+      if (!ev) continue;
+      if (WiFi.status() == WL_CONNECTED && !ev->controllerUrl.isEmpty() && !ev->commandId.isEmpty()) {
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        const String progressUrl = ev->controllerUrl + "/api/device/ota-progress";
+        if (http.begin(client, progressUrl)) {
+          http.setConnectTimeout(5000);
+          http.setTimeout(5000);
+          http.addHeader("Content-Type", "application/json");
+          http.addHeader("X-Device-Key", ev->deviceKey);
+          String body = "{\"deviceId\":\"" + ev->deviceId + "\",\"commandId\":\"" + ev->commandId + "\",\"status\":\"" + ev->state + "\",\"percent\":" + String(ev->percent) + ",\"downloaded\":" + String(ev->downloaded) + ",\"total\":" + String(ev->total) + ",\"tag\":\"" + ev->tag + "\",\"message\":\"" + ev->message + "\"}";
+          const int status = http.POST(body);
+          Serial.printf("[OTA] Progress report: %s %d%% HTTP %d\n", ev->state.c_str(), ev->percent, status);
+          http.end();
+        } else {
+          Serial.println("[OTA] Progress reporter: HTTP begin failed");
+        }
+      } else {
+        Serial.println("[OTA] Progress reporter: invalid event or WiFi disconnected");
+      }
+      delete ev;
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
 }
 
 void otaTask(void* parameter) {
@@ -178,8 +252,13 @@ void otaTask(void* parameter) {
   while (downloaded < total) {
     const size_t remaining = total - downloaded;
     const size_t want = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-    const size_t count = stream->readBytes(buffer, want);
-    if (count == 0) {
+    // Prefer non-blocking reads: only read when data is available to avoid long blocking
+    size_t count = 0;
+    int avail = stream->available();
+    if (avail > 0) {
+      const size_t toRead = avail < static_cast<int>(want) ? static_cast<size_t>(avail) : want;
+      count = stream->readBytes(buffer, toRead);
+    } else {
       const unsigned long now = millis();
       const unsigned long idle = now - lastProgressAt;
       if (idle >= OTA_NO_PROGRESS_TIMEOUT_MS) {
@@ -191,7 +270,7 @@ void otaTask(void* parameter) {
         Serial.printf("[OTA] Waiting for stream... %lu seconds remaining.\n", (OTA_NO_PROGRESS_TIMEOUT_MS - idle) / 1000UL);
         lastWaitLogAt = now;
       }
-      yield();
+      vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
 
@@ -214,7 +293,7 @@ void otaTask(void* parameter) {
       lastBucket = bucket;
       lastReportAt = now;
     }
-    yield();
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 
   const bool valid = writeOk && downloaded == total && Update.end(true);
@@ -296,7 +375,7 @@ void ControllerClient::sendHeartbeat() {
   String body = "{\"deviceId\":\"" + deviceId_ + "\",\"firmwareVersion\":\"" + firmwareVersion_ + "\",\"buildId\":\"" + buildId_ + "\",\"hardware\":\"esp32\",\"ip\":\"" + WiFi.localIP().toString() + "\",\"uptime\":" + String(millis()); if (pendingAcks_.length()) { body += ",\"commandAcks\":[" + pendingAcks_ + "]"; pendingAcks_.clear(); } body += "}";
   Serial.printf("[HEARTBEAT] POST %s\n", url.c_str()); const int status = http.POST(body); const String response = http.getString(); if (status == HTTP_CODE_OK) { Serial.printf("[HEARTBEAT] HTTP 200 | %s\n", response.c_str()); processCommands(response); } else { Serial.printf("[HEARTBEAT] FAILED HTTP %d | %s\n", status, response.c_str()); lastHeartbeatAt_ = millis() - (HEARTBEAT_INTERVAL_MS - FIRST_HEARTBEAT_RETRY_MS); } http.end();
 }
-void ControllerClient::loop() { if (provisioningMode_) dnsServer.processNextRequest(); webServer.handleClient(); if (WiFi.status() == WL_CONNECTED) sendHeartbeat(); else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); Serial.println("[WIFI] Disconnected. Retrying saved Wi-Fi..."); WiFi.reconnect(); } }
+void ControllerClient::loop() { if (provisioningMode_) dnsServer.processNextRequest(); webServer.handleClient(); if (WiFi.status() == WL_CONNECTED) { if (!otaRunning) sendHeartbeat(); } else if (!provisioningMode_ && millis() - lastWiFiRetryAt_ >= WIFI_RETRY_INTERVAL_MS) { lastWiFiRetryAt_ = millis(); Serial.println("[WIFI] Disconnected. Retrying saved Wi-Fi..."); WiFi.reconnect(); } }
 bool ControllerClient::provisioningMode() const { return provisioningMode_; }
 const String& ControllerClient::deviceId() const { return deviceId_; }
 const String& ControllerClient::deviceKey() const { return deviceKey_; }
