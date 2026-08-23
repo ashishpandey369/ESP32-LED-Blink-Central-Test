@@ -1,0 +1,40 @@
+#pragma once
+
+#include <Arduino.h>
+
+class ControllerClient {
+ public:
+  ControllerClient(const char* controllerUrl, const char* firmwareVersion, const char* buildId);
+
+  void begin();
+  void loop();
+  bool provisioningMode() const;
+  const String& deviceId() const;
+  const String& deviceKey() const;
+  bool consumeMessage(String& message);
+
+ private:
+  String controllerUrl_;
+  String firmwareVersion_;
+  String buildId_;
+  String deviceId_;
+  String deviceKey_;
+  String pendingMessage_;
+  String pendingAcks_;
+  bool provisioningMode_ = false;
+  unsigned long lastHeartbeatAt_ = 0;
+  unsigned long lastWiFiRetryAt_ = 0;
+
+  void loadOrCreateDeviceKey();
+  bool connectSavedWiFi();
+  void startProvisioning();
+  void handleProvisioningRequests();
+  void startWebServer();
+  void sendHeartbeat();
+  void processCommands(const String& json);
+  bool performOta(const String& commandId, const String& tag, const String& version);
+  void queueAck(const String& id, const char* status, const String& result = "");
+  String chipIdHex() const;
+  String generateDeviceKey() const;
+  String makeDeviceId() const;
+};
