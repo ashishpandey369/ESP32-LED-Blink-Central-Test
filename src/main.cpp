@@ -24,7 +24,7 @@ constexpr char APP_STATE_NAMESPACE[] = "uc_app_state";
 
 ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
 Preferences appStatePreferences;
-bool ledState = false;
+bool ledState = true;
 bool deviceEnabled = true;
 unsigned long lastBlinkAt = 0;
 
@@ -63,8 +63,8 @@ void setup() {
   delay(500);
   pinMode(LED_PIN_2, OUTPUT);
   pinMode(LED_PIN_4, OUTPUT);
-  digitalWrite(LED_PIN_2, LOW);
-  digitalWrite(LED_PIN_4, LOW);
+  digitalWrite(LED_PIN_2, ledState ? HIGH : LOW);
+  digitalWrite(LED_PIN_4, ledState ? LOW : HIGH);
   loadDeviceEnabledState();
 
   Serial.println();
