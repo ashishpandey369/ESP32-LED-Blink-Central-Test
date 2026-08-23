@@ -24,7 +24,7 @@ constexpr char APP_STATE_NAMESPACE[] = "uc_app_state";
 
 ControllerClient controller(UEC_CONTROLLER_URL, UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
 Preferences appStatePreferences;
-bool ledState = true;
+bool ledState = false;
 bool deviceEnabled = true;
 unsigned long lastBlinkAt = 0;
 
@@ -63,8 +63,9 @@ void setup() {
   delay(500);
   pinMode(LED_PIN_2, OUTPUT);
   pinMode(LED_PIN_4, OUTPUT);
-  digitalWrite(LED_PIN_2, ledState ? HIGH : LOW);
-  digitalWrite(LED_PIN_4, ledState ? LOW : HIGH);
+  // D2 remains OFF by default for v0.5.8; D4 will blink
+  digitalWrite(LED_PIN_2, LOW);
+  digitalWrite(LED_PIN_4, LOW);
   loadDeviceEnabledState();
 
   Serial.println();
@@ -113,9 +114,10 @@ void loop() {
   if (now - lastBlinkAt >= BLINK_INTERVAL_MS) {
     lastBlinkAt = now;
     ledState = !ledState;
-    digitalWrite(LED_PIN_2, ledState ? HIGH : LOW);
-    digitalWrite(LED_PIN_4, ledState ? LOW : HIGH);
-    Serial.printf("[LED] D2 -> %s | D4 -> %s\n", ledState ? "ON" : "OFF", ledState ? "OFF" : "ON");
+    // keep D2 OFF; toggle D4 only
+    digitalWrite(LED_PIN_2, LOW);
+    digitalWrite(LED_PIN_4, ledState ? HIGH : LOW);
+    Serial.printf("[LED] D2 -> %s | D4 -> %s\n", "OFF", ledState ? "ON" : "OFF");
   }
 
   delay(1);
