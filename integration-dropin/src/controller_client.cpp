@@ -501,7 +501,7 @@ void ControllerClient::sendHeartbeat() {
 void ControllerClient::startWebServer() {
   webServer.on("/", [&]() { handleProvisioningRequests(); });
   webServer.on("/scan", [&]() { WiFi.scanDelete(); WiFi.scanNetworks(true, true); webServer.sendHeader("Location", "/"); webServer.send(302, "text/plain", ""); });
-  webServer.onPost("/save", [&]() {
+  webServer.on("/save", HTTP_POST, [&]() {
     if (webServer.hasArg("ssid") && webServer.hasArg("password")) {
       const String ssid = webServer.arg("ssid");
       const String password = webServer.arg("password");
@@ -512,7 +512,8 @@ void ControllerClient::startWebServer() {
       webServer.sendHeader("Location", "/");
       webServer.send(302, "text/plain", "");
       delay(1000);
-      NVIC_SystemReset();
+      // Use ESP.restart() on ESP32 to reset after provisioning
+      ESP.restart();
     } else webServer.send(400, "text/plain", "Missing fields");
   });
   webServer.begin();
