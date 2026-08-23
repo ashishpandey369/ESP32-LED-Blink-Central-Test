@@ -17,7 +17,8 @@
 #define UEC_BLINK_INTERVAL_MS 1000
 #endif
 
-constexpr uint8_t LED_PIN = 2;
+constexpr uint8_t LED_PIN_2 = 2;
+constexpr uint8_t LED_PIN_4 = 4;
 constexpr unsigned long BLINK_INTERVAL_MS = UEC_BLINK_INTERVAL_MS;
 constexpr char APP_STATE_NAMESPACE[] = "uc_app_state";
 
@@ -43,7 +44,8 @@ void setDeviceEnabled(bool enabled) {
 
   if (!deviceEnabled) {
     ledState = false;
-    digitalWrite(LED_PIN, LOW);
+    digitalWrite(LED_PIN_2, LOW);
+    digitalWrite(LED_PIN_4, LOW);
   }
 
   Serial.printf("[DEVICE] Remote application control -> %s\n", deviceEnabled ? "ENABLED" : "DISABLED");
@@ -59,8 +61,10 @@ void controllerTask(void*) {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(LED_PIN_2, OUTPUT);
+  pinMode(LED_PIN_4, OUTPUT);
+  digitalWrite(LED_PIN_2, LOW);
+  digitalWrite(LED_PIN_4, LOW);
   loadDeviceEnabledState();
 
   Serial.println();
@@ -68,7 +72,7 @@ void setup() {
   Serial.println(" ESP32 LED Blink - Central Test Project");
   Serial.println("========================================");
   Serial.printf("[FW] Version: %s | Build: %s | Hardware: esp32\n", UEC_FIRMWARE_VERSION, UEC_BUILD_ID);
-  Serial.printf("[APP] LED GPIO: %u | Blink interval: %lu ms\n", LED_PIN, BLINK_INTERVAL_MS);
+  Serial.printf("[APP] LED GPIOs: D2=%u, D4=%u | Blink interval: %lu ms\n", LED_PIN_2, LED_PIN_4, BLINK_INTERVAL_MS);
   controller.begin();
 
   xTaskCreatePinnedToCore(
@@ -109,8 +113,9 @@ void loop() {
   if (now - lastBlinkAt >= BLINK_INTERVAL_MS) {
     lastBlinkAt = now;
     ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    Serial.printf("[LED] GPIO %u -> %s\n", LED_PIN, ledState ? "ON" : "OFF");
+    digitalWrite(LED_PIN_2, ledState ? HIGH : LOW);
+    digitalWrite(LED_PIN_4, ledState ? LOW : HIGH);
+    Serial.printf("[LED] D2 -> %s | D4 -> %s\n", ledState ? "ON" : "OFF", ledState ? "OFF" : "ON");
   }
 
   delay(1);
